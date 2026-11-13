@@ -42,7 +42,7 @@ def trace(path, arguments, max_attempts):
             match = INDIRECT.fullmatch(diagnostics[-1]) if diagnostics else None
             if result.returncode == 125 and match:
                 site, target = (int(value, 16) for value in match.groups())
-                if target in eligible and target not in targets.get(site, ()):
+                if (target in eligible or code.contains_rva(target)) and target not in targets.get(site, ()):
                     targets.setdefault(site, set()).add(target)
                     print(f"Discovered callback RVA {target:#x} at call RVA {site:#x}", flush=True)
                     continue

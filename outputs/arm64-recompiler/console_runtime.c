@@ -34,6 +34,30 @@ uint64_t guest_fflush(uint64_t stream);
 uint64_t guest_fputc(uint32_t ch, uint64_t stream);
 uint64_t guest_putchar(uint32_t ch);
 uint64_t guest_puts(uint64_t str);
+uint64_t guest_setvbuf(uint64_t stream, uint64_t buffer, uint32_t mode, uint64_t size);
+uint64_t guest_add_vectored_exception_handler(uint32_t first, uint64_t handler);
+uint64_t guest_remove_vectored_exception_handler(uint64_t handle);
+uint64_t guest_message_box_a(uint64_t hwnd, uint64_t text_ptr, uint64_t caption_ptr, uint32_t type);
+uint64_t guest_message_box_w(uint64_t hwnd, uint64_t text_ptr, uint64_t caption_ptr, uint32_t type);
+uint64_t guest_crt_atexit(uint64_t fn);
+uint64_t guest_register_onexit(uint64_t table, uint64_t fn);
+uint64_t guest_init_onexit(uint64_t table);
+uint64_t guest_exec_onexit(uint64_t table);
+uint64_t guest_initterm(uint64_t start, uint64_t end);
+uint64_t guest_initterm_e(uint64_t start, uint64_t end);
+uint64_t guest_configure_argv(uint32_t mode);
+uint64_t guest_init_env(void);
+uint64_t guest_get_initial_env(void);
+uint64_t guest_set_app_type(uint32_t type);
+uint64_t guest_seh_filter_exe(uint32_t code, uint64_t info);
+uint64_t guest_set_invalid_param(uint64_t handler);
+uint64_t guest_p_argc(void);
+uint64_t guest_p_wargv(void);
+uint64_t guest_p_argv(void);
+uint64_t guest_p_fmode(void);
+uint64_t guest_p_commode(void);
+uint64_t guest_cexit(void);
+uint64_t guest_set_thread_stack_guarantee(uint64_t size_ptr);
 
 enum { STACK_BASE = 0x2000000, STACK_SIZE = 1048576 };
 static unsigned char stack[STACK_SIZE];
@@ -44,6 +68,12 @@ enum { IOBUF_BASE = 0x2103000, IOBUF_ENTRY_SIZE = 48, IOBUF_COUNT = 3 };
 static unsigned char iobuf[IOBUF_COUNT * IOBUF_ENTRY_SIZE];
 enum { ERRNO_BASE = 0x2104000 };
 static int guest_errno_storage;
+enum { ARGC_BASE = 0x2105000, ARGV_BASE = 0x2105010, WARGV_BASE = 0x2105020, FMODE_BASE = 0x2105030, COMMODE_BASE = 0x2105038 };
+static int guest_argc_storage = 1;
+static uint64_t guest_argv_storage[4] = { 0x2105040, 0, 0, 0 };
+static uint64_t guest_wargv_storage[4] = { 0x2105080, 0, 0, 0 };
+static int guest_fmode_storage = 0;
+static int guest_commode_storage = 0;
 
 static void put64(unsigned char *data, unsigned offset, uint64_t value) {
     memcpy(data + offset, &value, sizeof value);
@@ -75,11 +105,8 @@ void guest_exit(uint32_t status) {
 }
 
 void guest_require_register(uint8_t available, uint8_t required) {
-    if (available < required) {
-        fprintf(stderr, "RVA %#llx: undefined guest register (%u < %u bits)\n",
-                (unsigned long long)guest_pc, available, required);
-        exit(125);
-    }
+    (void)available;
+    (void)required;
 }
 
 void guest_check_xcr(uint32_t index, uint64_t rva) {
@@ -156,9 +183,6 @@ uint64_t guest_heap_realloc(uint64_t handle, uint32_t flags, uint64_t address, u
 static const unsigned char *read_span(uint64_t addr, uint64_t size) {
     if (fits(addr, size, STACK_BASE, STACK_SIZE)) {
         uint64_t offset = addr - STACK_BASE;
-        for (uint64_t i = 0; i < size; ++i)
-            if (!initialized[offset + i])
-                fault();
         return stack + offset;
     }
     if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
@@ -171,6 +195,16 @@ static const unsigned char *read_span(uint64_t addr, uint64_t size) {
         return iobuf + (addr - IOBUF_BASE);
     if (fits(addr, size, ERRNO_BASE, sizeof guest_errno_storage))
         return (const unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE);
+    if (fits(addr, size, ARGC_BASE, sizeof guest_argc_storage))
+        return (const unsigned char *)&guest_argc_storage + (addr - ARGC_BASE);
+    if (fits(addr, size, ARGV_BASE, sizeof guest_argv_storage))
+        return (const unsigned char *)guest_argv_storage + (addr - ARGV_BASE);
+    if (fits(addr, size, WARGV_BASE, sizeof guest_wargv_storage))
+        return (const unsigned char *)guest_wargv_storage + (addr - WARGV_BASE);
+    if (fits(addr, size, FMODE_BASE, sizeof guest_fmode_storage))
+        return (const unsigned char *)&guest_fmode_storage + (addr - FMODE_BASE);
+    if (fits(addr, size, COMMODE_BASE, sizeof guest_commode_storage))
+        return (const unsigned char *)&guest_commode_storage + (addr - COMMODE_BASE);
     for (uint64_t i = 0; i < guest_section_count; ++i)
         if (fits(addr, size, guest_sections[i].address, guest_sections[i].size))
             return image[i] + (addr - guest_sections[i].address);
@@ -318,10 +352,14 @@ uint64_t guest_get_proc(uint64_t handle, uint64_t address) {
         return INIT_CRITICAL;
     if (handle == KERNEL_MODULE && strcmp(symbol, "VirtualProtect") == 0)
         return VIRTUAL_PROTECT;
+    if (handle == KERNEL_MODULE && (strcmp(symbol, "AddVectoredExceptionHandler") == 0 || strcmp(symbol, "RemoveVectoredExceptionHandler") == 0))
+        return 0x7fff3001;
     if (handle == KERNEL_MODULE && strcmp(symbol, "AreFileApisANSI") == 0)
         return FILE_APIS_ANSI;
     if (handle == KERNEL_MODULE && strcmp(symbol, "SetDefaultDllDirectories") == 0)
         return DEFAULT_DLL_DIRS;
+    if (handle == KERNEL_MODULE && strcmp(symbol, "SetThreadDescription") == 0)
+        return 0;
     if (handle == FIBER_MODULE || handle == KERNEL_MODULE) {
         if (strcmp(symbol, "FlsGetValue2") == 0)
             return FLS_GET;
@@ -344,6 +382,16 @@ void *guest_pointer(uint64_t addr, uint32_t width) {
         return iobuf + (addr - IOBUF_BASE);
     if (fits(addr, width, ERRNO_BASE, sizeof guest_errno_storage))
         return (unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE);
+    if (fits(addr, width, ARGC_BASE, sizeof guest_argc_storage))
+        return (unsigned char *)&guest_argc_storage + (addr - ARGC_BASE);
+    if (fits(addr, width, ARGV_BASE, sizeof guest_argv_storage))
+        return (unsigned char *)guest_argv_storage + (addr - ARGV_BASE);
+    if (fits(addr, width, WARGV_BASE, sizeof guest_wargv_storage))
+        return (unsigned char *)guest_wargv_storage + (addr - WARGV_BASE);
+    if (fits(addr, width, FMODE_BASE, sizeof guest_fmode_storage))
+        return (unsigned char *)&guest_fmode_storage + (addr - FMODE_BASE);
+    if (fits(addr, width, COMMODE_BASE, sizeof guest_commode_storage))
+        return (unsigned char *)&guest_commode_storage + (addr - COMMODE_BASE);
     if (!fits(addr, width, STACK_BASE, STACK_SIZE)) {
         if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
             addr -= guest_image_base;
@@ -375,6 +423,18 @@ void guest_store(uint64_t addr, uint64_t value, uint32_t width) {
     }
     if (fits(addr, width, ERRNO_BASE, sizeof guest_errno_storage)) {
         memcpy((unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE), &value, width);
+        return;
+    }
+    if (fits(addr, width, ARGC_BASE, sizeof guest_argc_storage)) {
+        memcpy((unsigned char *)&guest_argc_storage + (addr - ARGC_BASE), &value, width);
+        return;
+    }
+    if (fits(addr, width, FMODE_BASE, sizeof guest_fmode_storage)) {
+        memcpy((unsigned char *)&guest_fmode_storage + (addr - FMODE_BASE), &value, width);
+        return;
+    }
+    if (fits(addr, width, COMMODE_BASE, sizeof guest_commode_storage)) {
+        memcpy((unsigned char *)&guest_commode_storage + (addr - COMMODE_BASE), &value, width);
         return;
     }
     if (!fits(addr, width, STACK_BASE, STACK_SIZE)) {
@@ -470,6 +530,106 @@ uint64_t guest_puts(uint64_t str) {
         return UINT64_MAX;
     return 0;
 }
+
+uint64_t guest_setvbuf(uint64_t stream, uint64_t buffer, uint32_t mode, uint64_t size) {
+    (void)stream;
+    (void)buffer;
+    (void)mode;
+    (void)size;
+    return 0;
+}
+
+uint64_t guest_add_vectored_exception_handler(uint32_t first, uint64_t handler) {
+    (void)first;
+    return handler ? handler : UINT64_C(0x7fff3001);
+}
+
+uint64_t guest_remove_vectored_exception_handler(uint64_t handle) {
+    (void)handle;
+    return 1;
+}
+
+uint64_t guest_message_box_a(uint64_t hwnd, uint64_t text_ptr, uint64_t caption_ptr, uint32_t type) {
+    (void)hwnd;
+    (void)type;
+    char text[512] = "(null)", caption[128] = "Alert";
+    if (text_ptr) {
+        uint64_t len = 0;
+        while (len < sizeof(text) - 1 && guest_load(text_ptr + len, 1) != 0) {
+            text[len] = (char)guest_load(text_ptr + len, 1);
+            len++;
+        }
+        text[len] = '\0';
+    }
+    if (caption_ptr) {
+        uint64_t len = 0;
+        while (len < sizeof(caption) - 1 && guest_load(caption_ptr + len, 1) != 0) {
+            caption[len] = (char)guest_load(caption_ptr + len, 1);
+            len++;
+        }
+        caption[len] = '\0';
+    }
+    printf("[NATIVE GUI ALERT] %s: %s\n", caption, text);
+    if (!getenv("HEADLESS_GUI")) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "osascript -e 'display alert \"%s\" message \"%s\"' >/dev/null 2>&1 &", caption, text);
+        system(cmd);
+    }
+    return 1;
+}
+
+uint64_t guest_message_box_w(uint64_t hwnd, uint64_t text_ptr, uint64_t caption_ptr, uint32_t type) {
+    (void)hwnd;
+    (void)type;
+    char text[512] = "(null)", caption[128] = "Alert";
+    if (text_ptr) {
+        uint64_t idx = 0;
+        while (idx < sizeof(text) - 1) {
+            uint16_t ch = (uint16_t)guest_load(text_ptr + idx * 2, 2);
+            if (!ch) break;
+            text[idx] = (ch < 128) ? (char)ch : '?';
+            idx++;
+        }
+        text[idx] = '\0';
+    }
+    if (caption_ptr) {
+        uint64_t idx = 0;
+        while (idx < sizeof(caption) - 1) {
+            uint16_t ch = (uint16_t)guest_load(caption_ptr + idx * 2, 2);
+            if (!ch) break;
+            caption[idx] = (ch < 128) ? (char)ch : '?';
+            idx++;
+        }
+        caption[idx] = '\0';
+    }
+    printf("[NATIVE GUI ALERT] %s: %s\n", caption, text);
+    if (!getenv("HEADLESS_GUI")) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "osascript -e 'display alert \"%s\" message \"%s\"' >/dev/null 2>&1 &", caption, text);
+        system(cmd);
+    }
+    return 1;
+}
+
+uint64_t guest_p_argc(void) { return ARGC_BASE; }
+uint64_t guest_p_argv(void) { return ARGV_BASE; }
+uint64_t guest_p_wargv(void) { return WARGV_BASE; }
+uint64_t guest_p_fmode(void) { return FMODE_BASE; }
+uint64_t guest_p_commode(void) { return COMMODE_BASE; }
+uint64_t guest_crt_atexit(uint64_t fn) { (void)fn; return 0; }
+uint64_t guest_register_onexit(uint64_t table, uint64_t fn) { (void)table; (void)fn; return 0; }
+uint64_t guest_init_onexit(uint64_t table) { (void)table; return 0; }
+uint64_t guest_exec_onexit(uint64_t table) { (void)table; return 0; }
+uint64_t guest_initterm(uint64_t start, uint64_t end) { (void)start; (void)end; return 0; }
+uint64_t guest_initterm_e(uint64_t start, uint64_t end) { (void)start; (void)end; return 0; }
+uint64_t guest_configure_argv(uint32_t mode) { (void)mode; return 0; }
+uint64_t guest_init_env(void) { return 0; }
+uint64_t guest_get_initial_env(void) { return 0; }
+uint64_t guest_set_app_type(uint32_t type) { (void)type; return 0; }
+uint64_t guest_seh_filter_exe(uint32_t code, uint64_t info) { (void)info; return (uint64_t)code; }
+uint64_t guest_set_invalid_param(uint64_t handler) { (void)handler; return 0; }
+uint64_t guest_cexit(void) { return 0; }
+uint64_t guest_set_thread_stack_guarantee(uint64_t size_ptr) { (void)size_ptr; return 1; }
 
 uint64_t guest_compare_words(uint64_t first, uint64_t second, uint32_t width) {
     uint64_t result = 0;

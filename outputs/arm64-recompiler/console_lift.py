@@ -13,7 +13,7 @@ MAX_BLOCKS = 60000
 
 FLS_IMPORTS = {"FlsAlloc": 0x7fff1002, "FlsGetValue": 0x7fff1003, "FlsGetValue2": 0x7fff1003, "FlsSetValue": 0x7fff1004, "FlsFree": 0x7fff1005}
 IDENTITY_IMPORTS = {"GetCurrentProcessId": 0, "GetCurrentThreadId": 1}
-IMPORTS = {"GetStdHandle", "WriteFile", "ExitProcess", "SetLastError", "GetLastError", "GetSystemTimeAsFileTime", "QueryPerformanceCounter", "LoadLibraryExW", "GetProcAddress", "FreeLibrary", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc", "EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "InitializeCriticalSection", "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx", "VirtualProtect", "GetStartupInfoW", "GetFileType", "GetCommandLineA", "GetCommandLineW", "GetACP", "GetOEMCP", "IsValidCodePage", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetModuleHandleExW", "WideCharToMultiByte", "MultiByteToWideChar", "InitializeSListHead", "GetEnvironmentStringsW", "FreeEnvironmentStringsW", "SetUnhandledExceptionFilter", "GetSystemDirectoryA", "GetSystemDirectoryW", "LoadLibraryA", "__acrt_iob_func", "fwrite", "fputs", "fflush", "_errno", "fputc", "putchar", "puts"} | IDENTITY_IMPORTS.keys() | FLS_IMPORTS.keys()
+IMPORTS = {"GetStdHandle", "WriteFile", "ExitProcess", "SetLastError", "GetLastError", "GetSystemTimeAsFileTime", "QueryPerformanceCounter", "LoadLibraryExW", "GetProcAddress", "FreeLibrary", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc", "EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "InitializeCriticalSection", "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx", "VirtualProtect", "GetStartupInfoW", "GetFileType", "GetCommandLineA", "GetCommandLineW", "GetACP", "GetOEMCP", "IsValidCodePage", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetModuleHandleExW", "WideCharToMultiByte", "MultiByteToWideChar", "InitializeSListHead", "GetEnvironmentStringsW", "FreeEnvironmentStringsW", "SetUnhandledExceptionFilter", "GetSystemDirectoryA", "GetSystemDirectoryW", "LoadLibraryA", "__acrt_iob_func", "fwrite", "fputs", "fflush", "_errno", "fputc", "putchar", "puts", "setvbuf", "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler", "MessageBoxA", "MessageBoxW", "_crt_atexit", "_register_onexit_function", "_initialize_onexit_table", "_execute_onexit_table", "_initterm", "_initterm_e", "_configure_wide_argv", "_configure_narrow_argv", "_initialize_wide_environment", "_initialize_narrow_environment", "_get_initial_wide_environment", "_get_initial_narrow_environment", "_set_app_type", "_seh_filter_exe", "_set_invalid_parameter_handler", "__p___argc", "__p___wargv", "__p___argv", "exit", "_exit", "_cexit", "SetThreadStackGuarantee", "malloc", "free", "calloc", "realloc", "GetCurrentThread", "GetCurrentProcess", "__p__fmode", "__p__commode"} | IDENTITY_IMPORTS.keys() | FLS_IMPORTS.keys()
 VOLATILE = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
 NONVOLATILE = ("rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15")
 ALIASES = {
@@ -121,7 +121,7 @@ class ConsoleLift(Lift):
 
     def address(self, ins, operand):
         mem = operand.mem
-        if mem.segment not in (0, x.X86_REG_GS) or (ins.addr_size != 8 and ins.mnemonic != "lea"):
+        if mem.segment not in (0, x.X86_REG_GS) or (ins.addr_size not in (4, 8) and ins.mnemonic != "lea"):
             raise ValueError("unsupported segmented or narrow address")
         if mem.base == x.X86_REG_RIP:
             return str(ins.address + ins.size + mem.disp)
@@ -252,6 +252,104 @@ class ConsoleLift(Lift):
         elif name == "puts":
             string = self.read_reg("rcx", 64)
             result = self.value(f"call i64 @guest_puts(i64 {string})")
+        elif name == "setvbuf":
+            stream = self.read_reg("rcx", 64)
+            buffer = self.read_reg("rdx", 64)
+            mode = self.read_reg("r8", 32)
+            size = self.read_reg("r9", 64)
+            result = self.value(f"call i64 @guest_setvbuf(i64 {stream}, i64 {buffer}, i32 {mode}, i64 {size})")
+        elif name == "AddVectoredExceptionHandler":
+            first = self.read_reg("rcx", 32)
+            handler = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_add_vectored_exception_handler(i32 {first}, i64 {handler})")
+        elif name == "RemoveVectoredExceptionHandler":
+            handle = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_remove_vectored_exception_handler(i64 {handle})")
+        elif name == "MessageBoxA":
+            hwnd = self.read_reg("rcx", 64)
+            text = self.read_reg("rdx", 64)
+            caption = self.read_reg("r8", 64)
+            flags = self.read_reg("r9", 32)
+            result = self.value(f"call i64 @guest_message_box_a(i64 {hwnd}, i64 {text}, i64 {caption}, i32 {flags})")
+        elif name == "MessageBoxW":
+            hwnd = self.read_reg("rcx", 64)
+            text = self.read_reg("rdx", 64)
+            caption = self.read_reg("r8", 64)
+            flags = self.read_reg("r9", 32)
+            result = self.value(f"call i64 @guest_message_box_w(i64 {hwnd}, i64 {text}, i64 {caption}, i32 {flags})")
+        elif name == "_crt_atexit":
+            fn = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_crt_atexit(i64 {fn})")
+        elif name == "_register_onexit_function":
+            table = self.read_reg("rcx", 64)
+            fn = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_register_onexit(i64 {table}, i64 {fn})")
+        elif name == "_initialize_onexit_table":
+            table = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_init_onexit(i64 {table})")
+        elif name == "_execute_onexit_table":
+            table = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_exec_onexit(i64 {table})")
+        elif name == "_initterm":
+            start = self.read_reg("rcx", 64)
+            end = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_initterm(i64 {start}, i64 {end})")
+        elif name == "_initterm_e":
+            start = self.read_reg("rcx", 64)
+            end = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_initterm_e(i64 {start}, i64 {end})")
+        elif name in {"_configure_wide_argv", "_configure_narrow_argv"}:
+            mode = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_configure_argv(i32 {mode})")
+        elif name in {"_initialize_wide_environment", "_initialize_narrow_environment"}:
+            result = self.value("call i64 @guest_init_env()")
+        elif name in {"_get_initial_wide_environment", "_get_initial_narrow_environment"}:
+            result = self.value("call i64 @guest_get_initial_env()")
+        elif name == "_set_app_type":
+            type_val = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_set_app_type(i32 {type_val})")
+        elif name == "_seh_filter_exe":
+            code = self.read_reg("rcx", 32)
+            info = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_seh_filter_exe(i32 {code}, i64 {info})")
+        elif name == "_set_invalid_parameter_handler":
+            h = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_set_invalid_param(i64 {h})")
+        elif name == "__p___argc":
+            result = self.value("call i64 @guest_p_argc()")
+        elif name == "__p___wargv":
+            result = self.value("call i64 @guest_p_wargv()")
+        elif name == "__p___argv":
+            result = self.value("call i64 @guest_p_argv()")
+        elif name in {"exit", "_exit"}:
+            status = self.read_reg("rcx", 32)
+            self.line(f"  call void @guest_exit(i32 {status})")
+            self.line("  unreachable")
+            return
+        elif name == "_cexit":
+            result = self.value("call i64 @guest_cexit()")
+        elif name == "__p__fmode":
+            result = self.value("call i64 @guest_p_fmode()")
+        elif name == "__p__commode":
+            result = self.value("call i64 @guest_p_commode()")
+        elif name == "SetThreadStackGuarantee":
+            size_ptr = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_set_thread_stack_guarantee(i64 {size_ptr})")
+        elif name == "malloc":
+            size = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_heap_alloc(i64 {0x7fff2001}, i32 0, i64 {size})")
+        elif name == "free":
+            ptr = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_heap_free(i64 {0x7fff2001}, i32 0, i64 {ptr})")
+        elif name == "calloc":
+            num = self.read_reg("rcx", 64)
+            size = self.read_reg("rdx", 64)
+            total = self.value(f"mul i64 {num}, {size}")
+            result = self.value(f"call i64 @guest_heap_alloc(i64 {0x7fff2001}, i32 8, i64 {total})")
+        elif name == "realloc":
+            ptr = self.read_reg("rcx", 64)
+            size = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_heap_realloc(i64 {0x7fff2001}, i32 0, i64 {ptr}, i64 {size})")
         elif name == "InitializeSListHead":
             dest = self.read_reg("rcx", 64)
             high = self.value(f"add i64 {dest}, 8")
@@ -343,6 +441,10 @@ class ConsoleLift(Lift):
             address = self.read_reg("rcx", 64)
             self.line(f"  call void @guest_system_filetime(i64 {address})")
             result = None
+        elif name == "GetCurrentThread":
+            result = self.value("add i64 0, -2")
+        elif name == "GetCurrentProcess":
+            result = self.value("add i64 0, -1")
         elif name in IDENTITY_IMPORTS:
             result = self.value(f"call i64 @guest_identity(i32 {IDENTITY_IMPORTS[name]})")
         elif name == "QueryPerformanceCounter":
@@ -1052,6 +1154,8 @@ class ConsoleLift(Lift):
             if op == "setns":
                 value = self.value(f"xor i1 {value}, true")
             self.write(ins, args[0], self.value(f"zext i1 {value} to i8"))
+        elif op in {"nop", "fninit", "cld"}:
+            pass
         else:
             raise ValueError("unsupported console instruction")
         self.jump(following, returns)
@@ -1096,6 +1200,30 @@ class ConsoleLift(Lift):
         self.line("declare i64 @guest_fputc(i32, i64)")
         self.line("declare i64 @guest_putchar(i32)")
         self.line("declare i64 @guest_puts(i64)")
+        self.line("declare i64 @guest_setvbuf(i64, i64, i32, i64)")
+        self.line("declare i64 @guest_add_vectored_exception_handler(i32, i64)")
+        self.line("declare i64 @guest_remove_vectored_exception_handler(i64)")
+        self.line("declare i64 @guest_message_box_a(i64, i64, i64, i32)")
+        self.line("declare i64 @guest_message_box_w(i64, i64, i64, i32)")
+        self.line("declare i64 @guest_crt_atexit(i64)")
+        self.line("declare i64 @guest_register_onexit(i64, i64)")
+        self.line("declare i64 @guest_init_onexit(i64)")
+        self.line("declare i64 @guest_exec_onexit(i64)")
+        self.line("declare i64 @guest_initterm(i64, i64)")
+        self.line("declare i64 @guest_initterm_e(i64, i64)")
+        self.line("declare i64 @guest_configure_argv(i32)")
+        self.line("declare i64 @guest_init_env()")
+        self.line("declare i64 @guest_get_initial_env()")
+        self.line("declare i64 @guest_set_app_type(i32)")
+        self.line("declare i64 @guest_seh_filter_exe(i32, i64)")
+        self.line("declare i64 @guest_set_invalid_param(i64)")
+        self.line("declare i64 @guest_p_argc()")
+        self.line("declare i64 @guest_p_wargv()")
+        self.line("declare i64 @guest_p_argv()")
+        self.line("declare i64 @guest_p_fmode()")
+        self.line("declare i64 @guest_p_commode()")
+        self.line("declare i64 @guest_cexit()")
+        self.line("declare i64 @guest_set_thread_stack_guarantee(i64)")
         self.line("declare i64 @guest_heap_realloc(i64, i32, i64, i64)")
         self.line("declare i64 @guest_heap_alloc(i64, i32, i64)")
         self.line("declare i64 @guest_heap_free(i64, i32, i64)")

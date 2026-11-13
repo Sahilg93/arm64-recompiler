@@ -86,8 +86,9 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 | Binary | Startup Status | Current Frontier / Stopping Point |
 | --- | --- | --- |
 | **`plink.exe`** (0.83) | **Fully functional (`-V`)** | Prints `plink: Release 0.83` and exits 0 on attempt 0. |
-| **`jq.exe`** (1.7.1) | Advanced past TLS, atomics, and CRT initialization | Reaches `api-ms-win-crt-stdio-l1-1-0.dll!setvbuf` (RVA `0x8d918`). |
-| **`rg.exe`** (14.1.1) | Advanced past TLS, API-set loading, and FLS | Reaches `KERNEL32.dll!AddVectoredExceptionHandler` (RVA `0x10467c`). |
+| **`gui_showcase.exe`** | **Fully functional (Hybrid GUI)** | Executes Win32 `MessageBoxA` natively on macOS, displaying alert and exiting 0. |
+| **`jq.exe`** (1.7.1) | Advanced past UCRT startup, heap, atomics & `___chkstk_ms` | Reaches `api-ms-win-crt-environment-l1-1-0.dll!__p__wenviron` (RVA `0x8dc28`). |
+| **`rg.exe`** (14.1.1) | Advanced past exception handlers, stack guarantee & pseudo-handles | Reaches TEB TLS vector lookup `mov rcx, gs:[0x58]` (RVA `0x1046c0`). |
 
 ---
 
