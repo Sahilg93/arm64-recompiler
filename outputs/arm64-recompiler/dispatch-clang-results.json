@@ -1,0 +1,19 @@
+{
+  "export": "sqlite3_complete",
+  "dll_sha256": "e9ce57e76d62a55d650a6ee579b93fad46dbaedd5e83295d937aa1744aff7835",
+  "layout": "clang-signed-offset",
+  "indirect_jump_rva": "0x183e2",
+  "indirect_targets": [
+    "0x183b0",
+    "0x183e4",
+    "0x18420",
+    "0x18441",
+    "0x1844c",
+    "0x1848e",
+    "0x184d2",
+    "0x18e77"
+  ],
+  "guard_default_rva": "0x184d2",
+  "x86_and_arm64_verified_byte_values": 256,
+  "guarded_indirect_byte_values": 97
+}

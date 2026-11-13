@@ -1,0 +1,55 @@
+[
+  {
+    "file": "jq.exe",
+    "sha256": "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627",
+    "entry_rva": "0x1460",
+    "loader_requirements": [
+      "thread-local storage",
+      "writable image sections"
+    ],
+    "first_lift_blocker": "RVA 0x1467 (mov dword ptr [rax], 0): expected RIP-relative or stack-relative memory",
+    "import_slots": 214,
+    "known_import_slots": 2,
+    "writable_sections": [
+      ".data",
+      ".bss",
+      ".tls"
+    ],
+    "tls_directory": true,
+    "tls_callbacks": 3
+  },
+  {
+    "file": "plink.exe",
+    "sha256": "50479953865b30775056441b10fdcb984126ba4f98af4f64756902a807b453e7",
+    "entry_rva": "0x8507c",
+    "loader_requirements": [
+      "writable image sections"
+    ],
+    "first_lift_blocker": "RVA 0x852e0 (mov qword ptr [rsp + 0x20], rbx): unsupported register rbx",
+    "import_slots": 152,
+    "known_import_slots": 3,
+    "writable_sections": [
+      ".data"
+    ],
+    "tls_directory": false,
+    "tls_callbacks": 0
+  },
+  {
+    "file": "rg.exe",
+    "sha256": "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408",
+    "entry_rva": "0x2cfbac",
+    "loader_requirements": [
+      "thread-local storage",
+      "writable image sections"
+    ],
+    "first_lift_blocker": "RVA 0x2d0158 (mov qword ptr [rsp + 0x18], rbx): unsupported register rbx",
+    "import_slots": 130,
+    "known_import_slots": 3,
+    "writable_sections": [
+      ".data",
+      ".fptable"
+    ],
+    "tls_directory": true,
+    "tls_callbacks": 1
+  }
+]

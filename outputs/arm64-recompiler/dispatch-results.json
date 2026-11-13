@@ -1,0 +1,18 @@
+{
+  "export": "sqlite3_complete",
+  "dll_sha256": "70450594d9f5743484723e8a27b08f76257e32854fbe6943c96b2aefcdf1ce3b",
+  "layout": "two-level",
+  "indirect_jump_rva": "0x3ee75",
+  "indirect_targets": [
+    "0x3ee77",
+    "0x3ee7f",
+    "0x3eead",
+    "0x3eed4",
+    "0x3ef1d",
+    "0x3ef4d",
+    "0x3ef89"
+  ],
+  "guard_default_rva": "0x3ef89",
+  "x86_and_arm64_verified_byte_values": 256,
+  "guarded_indirect_byte_values": 88
+}

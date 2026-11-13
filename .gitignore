@@ -1,0 +1,38 @@
+# Operating system
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+work/venv/
+
+# Compiler and intermediate build outputs
+build/
+outputs/arm64-recompiler/build/
+outputs/*.zip
+*.ll
+*.o
+*.obj
+*.pdb
+*.dylib
+*.out
+*.err
+*.log
+*.bin
+*.trace
+*.dSYM/
+
+# Large work directory (wine prefixes, intermediate traces, etc.)
+# Keep only the corpus binaries needed for reproduction
+work/*
+!work/corpus/
+!work/corpus/*.exe
+work/corpus/*.zip
+

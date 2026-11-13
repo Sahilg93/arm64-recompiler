@@ -1,0 +1,115 @@
+[
+  {
+    "input": "jq.exe",
+    "artifacts": [],
+    "failures": [
+      {
+        "reason": "unsupported loader features: thread-local storage, writable image sections"
+      }
+    ],
+    "sha256": "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627",
+    "status": "failed"
+  },
+  {
+    "input": "plink.exe",
+    "artifacts": [],
+    "failures": [
+      {
+        "reason": "unsupported loader features: writable image sections"
+      }
+    ],
+    "sha256": "50479953865b30775056441b10fdcb984126ba4f98af4f64756902a807b453e7",
+    "status": "failed"
+  },
+  {
+    "input": "rg.exe",
+    "artifacts": [],
+    "failures": [
+      {
+        "reason": "unsupported loader features: thread-local storage, writable image sections"
+      }
+    ],
+    "sha256": "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408",
+    "status": "failed"
+  },
+  {
+    "input": "console-flow-loop.exe",
+    "artifacts": [
+      {
+        "path": "console-flow-loop-dc18996c6c0d/console-flow-loop",
+        "verification": "console write success: x86 and ARM64 agree on stdout and status 0\nconsole write failure: x86 and ARM64 agree on stdout and status 7"
+      }
+    ],
+    "failures": [],
+    "sha256": "dc18996c6c0d588b3ffc91ac80a68312da4ab0c5bfb82a7cd781e35c8be6d0ba",
+    "status": "converted"
+  },
+  {
+    "input": "console.exe",
+    "artifacts": [
+      {
+        "path": "console-8a8ca025c770/console",
+        "verification": "console write success: x86 and ARM64 agree on stdout and status 0\nconsole write failure: x86 and ARM64 agree on stdout and status 1"
+      }
+    ],
+    "failures": [],
+    "sha256": "8a8ca025c770a6855c657150de94bd03c94ea180b7a8d70900920856ac633c3f",
+    "status": "converted"
+  },
+  {
+    "input": "sqlite3.dll",
+    "artifacts": [
+      {
+        "path": "sqlite3-70450594d9f5/sqlite3_stricmp.dylib",
+        "verification": "69,732 exact return values matched. No writes outside the optional frame-save slot."
+      }
+    ],
+    "failures": [],
+    "sha256": "70450594d9f5743484723e8a27b08f76257e32854fbe6943c96b2aefcdf1ce3b",
+    "status": "converted"
+  },
+  {
+    "input": "sqlite-clang.dll",
+    "artifacts": [
+      {
+        "path": "sqlite-clang-e9ce57e76d62/sqlite3_stricmp.dylib",
+        "verification": "69,732 exact return values matched. No writes outside the optional frame-save slot."
+      }
+    ],
+    "failures": [],
+    "sha256": "e9ce57e76d62a55d650a6ee579b93fad46dbaedd5e83295d937aa1744aff7835",
+    "status": "converted"
+  },
+  {
+    "input": "sqlite3.dll",
+    "artifacts": [
+      {
+        "path": "sqlite3-ab57d0437795/sqlite3_stricmp.dylib",
+        "verification": "69,732 exact return values matched. No writes outside the optional frame-save slot."
+      }
+    ],
+    "failures": [],
+    "sha256": "ab57d0437795ecc757cb693f32ea224173fa9856594d95cfa6b5033e645cd1ec",
+    "status": "converted"
+  },
+  {
+    "input": "libxxhash.dll",
+    "artifacts": [
+      {
+        "path": "libxxhash-350044d51d1e/XXH32_canonicalFromHash.dylib",
+        "verification": "XXH32: 5,035 complete buffer comparisons passed"
+      },
+      {
+        "path": "libxxhash-350044d51d1e/XXH64_canonicalFromHash.dylib",
+        "verification": "XXH64: 5,067 complete buffer comparisons passed"
+      },
+      {
+        "path": "libxxhash-350044d51d1e/XXH128_canonicalFromHash.dylib",
+        "verification": "XXH128: 5,131 complete buffer comparisons passed"
+      }
+    ],
+    "failures": [],
+    "sha256": "350044d51d1ecd18e57eccc73924aad8666c989e6f874dd7cd79f7153fb97915",
+    "status": "converted"
+  }
+]
