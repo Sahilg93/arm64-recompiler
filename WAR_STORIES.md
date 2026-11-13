@@ -223,3 +223,17 @@ We also tracked previously applied protections to properly populate the `lpflOld
 3. **x86 arithmetic flags have subtle side-effects.** Lowering atomic instructions requires full flag emulation, not just boolean success checks.
 4. **API-set indirection is mandatory for modern Windows binaries.** Supporting `KERNEL32.dll` alone is insufficient for binaries compiled after 2015.
 5. **Always back emulated handles with real guest memory.** If guest code receives a pointer from a CRT shim, it will inevitably attempt to dereference it.
+
+---
+
+## 9. The Next Frontier: The Hybrid Architecture (Why Re-inventing USER32 is the Wrong Move)
+
+As this recompiler matures from console binaries (`plink`, `jq`, `rg`) toward desktop software with graphical interfaces, the question arises: *Do we need to rewrite all of Windows USER32, GDI, and DirectX?*
+
+**The short answer: No, and attempting to do so from scratch would be an architectural dead-end.**
+
+In the compatibility and emulation world (from Apple's Rosetta 2 + D3DMetal in the Game Porting Toolkit, to Box64/FEX-Emu on Linux, to Android's Houdini), the most successful pattern is **Hybrid AOT Recompilation with API Thunking**:
+- **Recompile Ahead-of-Time**: Compile the application logic, byte parsing, mathematical transforms, and tight inner loops to native Apple Silicon ARM64 instructions for maximum hardware throughput.
+- **Thunk the Periphery**: Forward complex Windows API boundaries (window creation, message dispatch loops, bitmap blits, and 3D rendering) across a thunking bridge to mature implementations like Wine, or translate DirectX calls to native Apple Metal.
+
+This division of labor plays to each component's strengths: the recompiler delivers peak raw CPU performance on Apple Silicon, while established compatibility layers handle the immense surface area of Windows desktop windowing and display drivers.

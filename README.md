@@ -108,6 +108,46 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 
 ---
 
+## 🔮 Future Roadmap: Hybrid Native AOT + GUI Thunking
+
+The long-term vision for this project is to expand beyond console utilities and run complex Windows software with **native Apple Silicon performance** without having to reimplement decades of Windows display infrastructure from scratch.
+
+### The Hybrid Architecture
+
+Rather than trying to write a custom replacement for millions of lines of Windows GUI subsystems (USER32, GDI, Direct3D, Direct2D, COM, WinUI), the planned trajectory is a **Hybrid AOT + API Thunking Model**:
+
+```
+┌────────────────────────────────────────────────────────┐
+│             Windows x86-64 PE Application             │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+             [Static LLVM IR Recompiler]
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│           Native Apple Silicon ARM64 Mach-O            │
+│  • Application Business Logic & Math (Full AOT Speed)   │
+│  • Memory Management & Heap Allocator (Native macOS)   │
+│  • Multi-threading & Atomics (Native Hardware CAS)     │
+└────────────┬───────────────────────────────┬───────────┘
+             │                               │
+    [System & File I/O]             [GUI & Graphics Calls]
+             │                               │
+             ▼                               ▼
+┌─────────────────────────┐     ┌────────────────────────┐
+│   Native POSIX Shims    │     │   Wine / Rosetta /     │
+│   (Console, FS, Net)    │     │   Metal Thunking Layer │
+└─────────────────────────┘     │ (USER32, GDI, Direct3D)│
+                                └────────────────────────┘
+```
+
+### Why This Architecture?
+- **Raw CPU Performance Where It Matters**: The computational core, physics, audio processing, parsing, and inner loops run natively on Apple Silicon with zero translation or emulation overhead.
+- **Pragmatic Graphics & Windowing**: Wine has spent over 30 years battle-testing USER32/GDI window message loops, font rasterization, and display servers on macOS. Thunking GUI calls across the boundary into Wine—or bridging Direct3D calls to native Apple Metal (similar to Apple's Game Porting Toolkit / DXMT approach)—delivers full graphical application support without duplicating multi-decade wheel re-inventions.
+- **Best of Both Worlds**: Near-native CPU throughput paired with battle-tested Windows desktop compatibility.
+
+---
+
 ## Additional Documentation
 
 - [Start Here & Quick Reference](outputs/arm64-recompiler/START.md) — Detailed environment setup and command-line usage.
