@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Windows x64 to Apple Silicon Recompiler | Interactive Showcase</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    code, pre { font-family: 'JetBrains Mono', monospace; }
+    .glow-cyan { box-shadow: 0 0 25px rgba(6, 182, 212, 0.25); }
+    .glow-emerald { box-shadow: 0 0 25px rgba(16, 185, 129, 0.25); }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen antialiased selection:bg-cyan-500 selection:text-slate-950">
+
+  <!-- Navigation / Top Banner -->
+  <header class="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <span class="p-2 bg-gradient-to-tr from-cyan-500 to-emerald-400 rounded-lg text-slate-950 font-black text-sm">AOT</span>
+        <span class="font-bold text-lg tracking-tight bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 bg-clip-text text-transparent">
+          arm64-recompiler
+        </span>
+        <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-950/80 text-cyan-400 border border-cyan-800/50">research showcase</span>
+      </div>
+      <div class="flex items-center space-x-4">
+        <a href="https://github.com/Sahilg93/arm64-recompiler" target="_blank" class="text-xs sm:text-sm font-medium px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center space-x-2">
+          <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          <span>View on GitHub</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-12">
+    <div class="text-center max-w-3xl mx-auto space-y-4">
+      <h1 class="text-3xl sm:text-5xl font-extrabold tracking-tight">
+        Static Recompilation of <span class="bg-gradient-to-r from-blue-400 via-cyan-300 to-emerald-400 bg-clip-text text-transparent">Windows x86-64</span> to <span class="text-white">Apple Silicon ARM64</span>
+      </h1>
+      <p class="text-slate-400 text-sm sm:text-base leading-relaxed">
+        Lifting original Windows PE binaries to LLVM Intermediate Representation and compiling native Mach-O executables.
+        Verified on PuTTY Plink 0.83: <strong class="text-emerald-400">6.20× faster cold start</strong> with <strong class="text-cyan-400">68.9% less memory</strong> than Wine + Rosetta.
+      </p>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <div class="flex justify-center border-b border-slate-800">
+      <nav class="flex space-x-2 sm:space-x-8" id="tabNav">
+        <button onclick="setTab('race')" id="tab-race" class="tab-btn px-4 py-3 font-semibold text-sm border-b-2 border-cyan-400 text-cyan-300">
+          ⚡ Benchmark Race
+        </button>
+        <button onclick="setTab('pipeline')" id="tab-pipeline" class="tab-btn px-4 py-3 font-medium text-sm border-b-2 border-transparent text-slate-400 hover:text-slate-200">
+          🔬 Disassembler & Lifter
+        </button>
+        <button onclick="setTab('flow')" id="tab-flow" class="tab-btn px-4 py-3 font-medium text-sm border-b-2 border-transparent text-slate-400 hover:text-slate-200">
+          🏛️ Architecture & Runtime
+        </button>
+        <button onclick="setTab('corpus')" id="tab-corpus" class="tab-btn px-4 py-3 font-medium text-sm border-b-2 border-transparent text-slate-400 hover:text-slate-200">
+          🎯 Corpus Tracker
+        </button>
+      </nav>
+    </div>
+
+    <!-- TAB 1: BENCHMARK RACE -->
+    <section id="panel-race" class="space-y-8">
+      <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 sm:p-8 space-y-6 glow-cyan">
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+          <div>
+            <h2 class="text-xl font-bold text-white flex items-center space-x-2">
+              <span>PuTTY Plink 0.83 (<code class="text-cyan-400 text-sm">-V</code> Cold Start)</span>
+            </h2>
+            <p class="text-xs text-slate-400">Comparing median wall-clock execution time and peak RSS across 30 runs on Apple Silicon.</p>
+          </div>
+          <button onclick="runRace()" id="raceBtn" class="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-slate-950 font-bold text-sm rounded-xl transition shadow-lg flex items-center space-x-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <span>Run Benchmark Race</span>
+          </button>
+        </div>
+
+        <!-- Race Visualizer -->
+        <div class="space-y-6 pt-4">
+          <!-- Recompiled Native ARM64 -->
+          <div class="space-y-2">
+            <div class="flex justify-between text-xs sm:text-sm font-semibold">
+              <span class="flex items-center space-x-2 text-emerald-400">
+                <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span>Recompiled Native ARM64 (-O2)</span>
+                <span class="text-[10px] uppercase tracking-wider bg-emerald-950 text-emerald-300 border border-emerald-800 px-1.5 py-0.5 rounded">6.20× Speedup</span>
+              </span>
+              <span class="font-mono text-emerald-400" id="time-arm64">42.31 ms <span class="text-slate-500 font-normal">(5.51 MB RSS)</span></span>
+            </div>
+            <div class="h-4 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+              <div id="bar-arm64" class="h-full bg-gradient-to-r from-emerald-500 to-teal-400 rounded-full transition-all duration-700 ease-out" style="width: 16%;"></div>
+            </div>
+          </div>
+
+          <!-- Wine + Rosetta 2 -->
+          <div class="space-y-2">
+            <div class="flex justify-between text-xs sm:text-sm font-semibold">
+              <span class="flex items-center space-x-2 text-rose-400">
+                <span class="w-2.5 h-2.5 rounded-full bg-rose-400"></span>
+                <span>Original Windows PE via Wine + Rosetta 2</span>
+                <span class="text-[10px] uppercase tracking-wider bg-rose-950 text-rose-300 border border-rose-800 px-1.5 py-0.5 rounded">1.00× Baseline</span>
+              </span>
+              <span class="font-mono text-rose-400" id="time-wine">262.23 ms <span class="text-slate-500 font-normal">(17.74 MB RSS)</span></span>
+            </div>
+            <div class="h-4 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+              <div id="bar-wine" class="h-full bg-gradient-to-r from-rose-500 to-orange-400 rounded-full transition-all duration-1000 ease-out" style="width: 100%;"></div>
+            </div>
+          </div>
+
+          <!-- Upstream macOS Native -->
+          <div class="space-y-2">
+            <div class="flex justify-between text-xs sm:text-sm font-semibold">
+              <span class="flex items-center space-x-2 text-cyan-400">
+                <span class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+                <span>Upstream macOS Native Build</span>
+                <span class="text-[10px] uppercase tracking-wider bg-cyan-950 text-cyan-300 border border-cyan-800 px-1.5 py-0.5 rounded">Reference Target</span>
+              </span>
+              <span class="font-mono text-cyan-400" id="time-upstream">7.41 ms <span class="text-slate-500 font-normal">(2.23 MB RSS)</span></span>
+            </div>
+            <div class="h-4 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+              <div id="bar-upstream" class="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-300 ease-out" style="width: 3%;"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Terminal Output Viewer -->
+        <div class="mt-6 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden">
+          <div class="px-4 py-2 border-b border-slate-800 bg-slate-900/80 flex items-center justify-between text-xs text-slate-400">
+            <span class="flex items-center space-x-2">
+              <span class="w-3 h-3 rounded-full bg-rose-500/80 inline-block"></span>
+              <span class="w-3 h-3 rounded-full bg-amber-500/80 inline-block"></span>
+              <span class="w-3 h-3 rounded-full bg-emerald-500/80 inline-block"></span>
+              <span class="font-mono ml-2">stdout (byte-matched output across runs)</span>
+            </span>
+            <span class="text-emerald-400 font-mono">exit status: 0</span>
+          </div>
+          <pre class="p-4 text-xs font-mono text-emerald-300/90 leading-relaxed overflow-x-auto">plink: Release 0.83
+Build platform: 64-bit x86 Windows
+Compiler: clang 14.0.6 , emulating Visual Studio 2022 (17.2), _MSC_VER=1932, _MSC_FULL_VER=193231329
+Source commit: d2c178c49a0ae6fa9ef75ca84fb3c9d0d675ea85</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: PIPELINE EXPLORER -->
+    <section id="panel-pipeline" class="space-y-6 hidden">
+      <div class="flex flex-wrap gap-2 pb-2">
+        <button onclick="setSample('cmpxchg')" id="btn-cmpxchg" class="sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-950 border border-cyan-700 text-cyan-300">
+          Atomic CAS (lock cmpxchg)
+        </button>
+        <button onclick="setSample('pdata')" id="btn-pdata" class="sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200">
+          .pdata Function Discovery
+        </button>
+        <button onclick="setSample('apiset')" id="btn-apiset" class="sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200">
+          Dynamic API-Set Routing
+        </button>
+        <button onclick="setSample('ucrt')" id="btn-ucrt" class="sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200">
+          UCRT Stdio & __acrt_iob_func
+        </button>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <!-- x86 Column -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 bg-slate-950/80 border-b border-slate-800 flex justify-between items-center">
+            <span class="text-xs font-bold text-blue-400 uppercase tracking-wider">1. Windows x86-64</span>
+            <span class="text-[10px] text-slate-500">PE Machine Bytes</span>
+          </div>
+          <pre id="code-x86" class="p-4 text-xs font-mono text-slate-300 flex-1 overflow-x-auto leading-relaxed"></pre>
+        </div>
+
+        <!-- LLVM IR Column -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 bg-slate-950/80 border-b border-slate-800 flex justify-between items-center">
+            <span class="text-xs font-bold text-amber-400 uppercase tracking-wider">2. Lowered LLVM IR</span>
+            <span class="text-[10px] text-slate-500">console_lift.py</span>
+          </div>
+          <pre id="code-llvm" class="p-4 text-xs font-mono text-amber-200/90 flex-1 overflow-x-auto leading-relaxed"></pre>
+        </div>
+
+        <!-- ARM64 Column -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl overflow-hidden flex flex-col">
+          <div class="px-4 py-2.5 bg-slate-950/80 border-b border-slate-800 flex justify-between items-center">
+            <span class="text-xs font-bold text-emerald-400 uppercase tracking-wider">3. Native Apple Silicon</span>
+            <span class="text-[10px] text-slate-500">Clang Mach-O ARM64</span>
+          </div>
+          <pre id="code-arm64" class="p-4 text-xs font-mono text-emerald-300 flex-1 overflow-x-auto leading-relaxed"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: ARCHITECTURE & RUNTIME -->
+    <section id="panel-flow" class="space-y-6 hidden">
+      <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 sm:p-8 space-y-6">
+        <h2 class="text-xl font-bold text-white">Guest Virtual Memory Architecture</h2>
+        <p class="text-xs text-slate-400">Bounded memory spaces mapped and managed by <code class="text-cyan-400">console_runtime.c</code>:</p>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs sm:text-sm font-mono border-collapse">
+            <thead>
+              <tr class="border-b border-slate-800 text-slate-400">
+                <th class="py-2.5 px-4">Address Range</th>
+                <th class="py-2.5 px-4">Segment</th>
+                <th class="py-2.5 px-4">Role & Protection</th>
+                <th class="py-2.5 px-4">Backing Strategy</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800/60 text-slate-300">
+              <tr>
+                <td class="py-2.5 px-4 text-cyan-400">0x140000000+</td>
+                <td class="py-2.5 px-4 font-bold text-white">PE Sections</td>
+                <td class="py-2.5 px-4">.text (RX), .rdata (RO), .data (RW)</td>
+                <td class="py-2.5 px-4 text-slate-400">POSIX mprotect mapping</td>
+              </tr>
+              <tr>
+                <td class="py-2.5 px-4 text-cyan-400">0x002000000</td>
+                <td class="py-2.5 px-4 font-bold text-white">TEB / PEB</td>
+                <td class="py-2.5 px-4">Thread & Process Environment Blocks</td>
+                <td class="py-2.5 px-4 text-slate-400">Emulated synthetic structs</td>
+              </tr>
+              <tr>
+                <td class="py-2.5 px-4 text-cyan-400">0x002100000</td>
+                <td class="py-2.5 px-4 font-bold text-white">FLS Storage</td>
+                <td class="py-2.5 px-4">Fiber Local Storage (128 slots)</td>
+                <td class="py-2.5 px-4 text-slate-400">FlsAlloc, FlsGetValue2 shim</td>
+              </tr>
+              <tr>
+                <td class="py-2.5 px-4 text-cyan-400">0x002103000</td>
+                <td class="py-2.5 px-4 font-bold text-white">UCRT _iobuf</td>
+                <td class="py-2.5 px-4">Standard stream buffers (stdin, stdout, stderr)</td>
+                <td class="py-2.5 px-4 text-slate-400">3x 48-byte stream descriptors</td>
+              </tr>
+              <tr>
+                <td class="py-2.5 px-4 text-cyan-400">0x003000000</td>
+                <td class="py-2.5 px-4 font-bold text-white">Guest Heap</td>
+                <td class="py-2.5 px-4">Dynamic allocations (HeapAlloc/ReAlloc)</td>
+                <td class="py-2.5 px-4 text-slate-400">Bounded slab allocator</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: CORPUS TRACKER -->
+    <section id="panel-corpus" class="space-y-6 hidden">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <!-- Plink Card -->
+        <div class="bg-slate-900/80 border border-emerald-500/40 rounded-2xl p-6 space-y-4 glow-emerald">
+          <div class="flex justify-between items-start">
+            <div>
+              <h3 class="font-bold text-lg text-white">PuTTY Plink 0.83</h3>
+              <p class="text-xs text-slate-400">MSVC C Runtime + Win32 Console</p>
+            </div>
+            <span class="px-2.5 py-1 text-[11px] font-bold rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800">100% WORKING</span>
+          </div>
+          <p class="text-xs text-slate-300">
+            Executes natively through CRT startup, `.pdata` discovery, TLS callbacks, argument vector parsing, and stdio flush. Matches byte-for-byte with status 0.
+          </p>
+          <div class="text-[11px] font-mono text-emerald-400 bg-emerald-950/40 p-2.5 rounded-lg border border-emerald-900/50">
+            ✔ Cold start: 42.31 ms (6.2x speedup)
+          </div>
+        </div>
+
+        <!-- jq Card -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div class="flex justify-between items-start">
+            <div>
+              <h3 class="font-bold text-lg text-white">jq 1.7.1</h3>
+              <p class="text-xs text-slate-400">MinGW-w64 + UCRT Runtime</p>
+            </div>
+            <span class="px-2.5 py-1 text-[11px] font-bold rounded-full bg-cyan-950 text-cyan-400 border border-cyan-800">IN PROGRESS</span>
+          </div>
+          <p class="text-xs text-slate-300">
+            Executes past TLS callbacks, atomic memory operations (`lock cmpxchg`), and CRT stdio initialization (`__acrt_iob_func`).
+          </p>
+          <div class="text-[11px] font-mono text-amber-300 bg-amber-950/40 p-2.5 rounded-lg border border-amber-900/50">
+            Frontier: UCRT setvbuf stream config (0x8d918)
+          </div>
+        </div>
+
+        <!-- ripgrep Card -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div class="flex justify-between items-start">
+            <div>
+              <h3 class="font-bold text-lg text-white">ripgrep 14.1.1</h3>
+              <p class="text-xs text-slate-400">Rust 64-bit MSVC Binary</p>
+            </div>
+            <span class="px-2.5 py-1 text-[11px] font-bold rounded-full bg-cyan-950 text-cyan-400 border border-cyan-800">IN PROGRESS</span>
+          </div>
+          <p class="text-xs text-slate-300">
+            Executes past TLS initialization, dynamic prefix API-set resolution (`api-ms-win-core-*`), and `FlsGetValue2`.
+          </p>
+          <div class="text-[11px] font-mono text-amber-300 bg-amber-950/40 p-2.5 rounded-lg border border-amber-900/50">
+            Frontier: AddVectoredExceptionHandler (0x10467c)
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Interactive Scripts -->
+  <script>
+    const SAMPLES = {
+      cmpxchg: {
+        x86: `; Atomic Compare-and-Swap
+; Hex: f0 48 0f b1 33
+lock cmpxchg qword ptr [rbx], rsi
+
+; Semantics:
+; If [rbx] == rax:
+;    [rbx] = rsi, ZF = 1
+; Else:
+;    rax = [rbx], ZF = 0
+; Sets CF, SF, OF, AF per CMP`,
+        llvm: `; Lowered to LLVM Atomic CMPXCHG
+%ptr = inttoptr i64 %rbx to i64*
+%res = cmpxchg i64* %ptr, i64 %rax, i64 %rsi seq_cst seq_cst
+%old = extractvalue { i64, i1 } %res, 0
+%success = extractvalue { i64, i1 } %res, 1
+
+; Update guest register RAX on failure
+%new_rax = select i1 %success, i64 %rax, i64 %old
+
+; Calculate x86 CMP flags (expected - old)
+%diff = sub i64 %rax, %old
+%zf = zext i1 %success to i64`,
+        arm64: `; Native Apple Silicon ARM64
+mov    x8, x0          ; Expected RAX
+casal  x8, x1, [x2]    ; Hardware CAS
+cmp    x8, x0          ; Compare old vs expected
+cset   w3, eq          ; Emulate x86 ZF`
+      },
+      pdata: {
+        x86: `; PE .pdata Exception Table Entry
+; 12-byte RUNTIME_FUNCTION struct
+dd 0x00001350  ; BeginAddress (RVA)
+dd 0x00001420  ; EndAddress
+dd 0x00085a10  ; UnwindInfo Address
+
+; Target is validated as inside .text`,
+        llvm: `; Global Indirect Call Dispatch Switch
+switch i64 %target_rva, label %unresolved_trap [
+  i64 4944,  label %entry_0x1350
+  i64 8240,  label %entry_0x2030
+  i64 9120,  label %entry_0x23a0
+]
+
+unresolved_trap:
+  call void @guest_trap(i64 %target_rva)`,
+        arm64: `; Branch Target Identification (BTI)
+adrp   x8, _dispatch_table@PAGE
+ldr    x8, [x8, _dispatch_table@PAGEOFF]
+br     x8              ; Jump to resolved target`
+      },
+      apiset: {
+        x86: `; Call to dynamic API-set
+lea rdx, [api_set_str]
+call qword ptr [__imp_LoadLibraryExW]
+; String: "api-ms-win-core-fibers-l1-1-2"`,
+        llvm: `%name_ptr = inttoptr i64 %rcx to i16*
+%mod = call i64 @guest_load_library_ex_w(i16* %name_ptr)
+; Maps prefix to synthetic KERNEL_MODULE`,
+        arm64: `; Prefix matching in runtime
+adrp   x0, l_prefix@PAGE
+bl     _wcsncmp
+cbnz   w0, L_fallback
+mov    x0, #0x2000000  ; KERNEL_MODULE`
+      },
+      ucrt: {
+        x86: `; UCRT Standard Stream Access
+mov ecx, 1   ; 1 = stdout
+call qword ptr [__imp___acrt_iob_func]
+; RAX receives pointer to FILE structure`,
+        llvm: `%stream_idx = trunc i64 %rcx to i32
+%iobuf_ptr = call i64 @guest_acrt_iob_func(i32 %stream_idx)
+; Returns IOBUF_BASE + (idx * 48)`,
+        arm64: `; Direct stream slot return
+mov    w8, #0x3000
+movk   w8, #0x210, lsl #16  ; 0x2103000
+add    x0, x8, x0, lsl #5   ; Fast indexed offset
+ret`
+      }
+    };
+
+    function setTab(tab) {
+      ['race', 'pipeline', 'flow', 'corpus'].forEach(t => {
+        document.getElementById(`panel-${t}`).classList.add('hidden');
+        const b = document.getElementById(`tab-${t}`);
+        b.className = "tab-btn px-4 py-3 font-medium text-sm border-b-2 border-transparent text-slate-400 hover:text-slate-200";
+      });
+      document.getElementById(`panel-${tab}`).classList.remove('hidden');
+      const active = document.getElementById(`tab-${tab}`);
+      active.className = "tab-btn px-4 py-3 font-semibold text-sm border-b-2 border-cyan-400 text-cyan-300";
+    }
+
+    function setSample(key) {
+      document.querySelectorAll('.sample-btn').forEach(b => {
+        b.className = "sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200";
+      });
+      document.getElementById(`btn-${key}`).className = "sample-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-950 border border-cyan-700 text-cyan-300";
+
+      document.getElementById('code-x86').textContent = SAMPLES[key].x86;
+      document.getElementById('code-llvm').textContent = SAMPLES[key].llvm;
+      document.getElementById('code-arm64').textContent = SAMPLES[key].arm64;
+    }
+
+    function runRace() {
+      const bArm = document.getElementById('bar-arm64');
+      const bWine = document.getElementById('bar-wine');
+      const bUp = document.getElementById('bar-upstream');
+
+      bArm.style.width = '0%';
+      bWine.style.width = '0%';
+      bUp.style.width = '0%';
+
+      setTimeout(() => { bUp.style.width = '3%'; }, 50);
+      setTimeout(() => { bArm.style.width = '16%'; }, 150);
+      setTimeout(() => { bWine.style.width = '100%'; }, 350);
+    }
+
+    // Init
+    setSample('cmpxchg');
+  </script>
+</body>
+</html>

@@ -13,8 +13,24 @@ The primary whole-program milestone is the original Windows release of **PuTTY P
 | [`outputs/arm64-recompiler/`](outputs/arm64-recompiler/) | Core lifters, runtime emulation, diagnostics, and test harness |
 | [`outputs/arm64-recompiler/console_lift.py`](outputs/arm64-recompiler/console_lift.py) | Whole-program PE x86-64 lifter emitting LLVM IR |
 | [`outputs/arm64-recompiler/console_runtime.c`](outputs/arm64-recompiler/console_runtime.c) | Minimal Win32 / CRT runtime shim (memory, TEB/PEB, TLS, FLS, sync, stdio) |
+| [`WAR_STORIES.md`](WAR_STORIES.md) | **Deep-dive post-mortem of failures, subtle bugs, and engineering war stories** |
 | [`work/corpus/`](work/corpus/) | Original Windows x64 release binaries (`plink.exe`, `jq.exe`, `rg.exe`) |
 | [`work/`](work/) | Test environments, diagnostic traces, and generated builds |
+
+---
+
+## 💥 Failures, Roadblocks & War Stories
+
+Static binary recompilation from Windows x86-64 to Apple Silicon is full of edge cases and undocumented runtime behaviors. 
+
+Check out [**`WAR_STORIES.md`**](WAR_STORIES.md) for an honest, detailed breakdown of the real failures faced and how they were solved:
+1. **The Indirect Branch & Callback Discovery Trap** (How PE `.pdata` exception directory parsing replaced multi-pass discovery).
+2. **The `lock cmpxchg` Flag Calculation Bug** (How an inverted operand in x86 `CMP` flag emulation broke atomic spinlocks).
+3. **The TLS Callback Chicken-and-Egg Trap** (Why `jq` and `rg` crashed before `AddressOfEntryPoint` without pre-main TLS callbacks).
+4. **The Universal Import Filter Blocker** (Why hardcoding `KERNEL32.dll` silently dropped Universal CRT functions).
+5. **The Modern Windows API-Set Prefix Maze** (Navigating schema-based virtual DLL indirection in MSVC/Rust).
+6. **The UCRT `_iobuf` / `FILE*` Memory Impass** (Why fake stream handles crash guest code and how bounded `_iobuf` tables fixed it).
+7. **Virtual Memory Protection Translation** (Mapping Win32 page protection bitmasks to POSIX `mprotect`).
 
 ---
 
