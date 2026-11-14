@@ -34,6 +34,7 @@ outputs/*.zip
 work/*
 !work/corpus/
 !work/corpus/*.exe
+!work/bench_suite.py
 work/corpus/*.zip
 
 
