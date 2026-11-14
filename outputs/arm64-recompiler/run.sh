@@ -179,6 +179,8 @@ if [[ -n "${XWIN_SDK:-}" ]] && command -v "${CLANG_CL:-clang-cl}" > /dev/null &&
    command -v "${LLD_LINK:-lld-link}" > /dev/null; then
     fixtures/exception/test_msvc.sh
     echo "PASS MSVC exception fixture${WINE:+ (matches Wine)}"
+    # A real system DLL: Wine's ucrtbase.dll lifted and loaded in place of the CRT shims.
+    fixtures/crt/test.sh
 elif [[ "${REQUIRE_MSVC:-0}" == 1 ]]; then
     echo "MSVC exception fixture needs XWIN_SDK, clang-cl, and lld-link" >&2
     exit 1

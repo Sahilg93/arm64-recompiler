@@ -17,6 +17,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <malloc/malloc.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <errno.h>
@@ -89,6 +90,9 @@ uint64_t guest_isspace(uint32_t c);
 uint64_t guest_process_prng(uint64_t buffer, uint64_t size);
 uint64_t guest_performance_counter(uint64_t address);
 void guest_system_filetime(uint64_t address);
+uint64_t guest_command_line(uint32_t wide);
+uint64_t guest_convert_text(uint32_t wide, uint32_t page, uint32_t flags,
+                            uint64_t source, int32_t length, uint64_t dest, uint64_t size);
 void guest_set_last_error(uint32_t value);
 uint64_t guest_get_last_error(void);
 uint64_t guest_stdout(uint32_t selector);
@@ -130,14 +134,16 @@ enum {
     ENVIRON_BASE = 0x2105048,
     TLS_BASE = 0x2106000, TLS_SIZE = 1048576
 };
-static unsigned char stack[STACK_SIZE];
+/* Guest memory backed by host arrays: keep it 16-byte aligned so aligned guest
+   accesses (including lifted atomics, which fault when misaligned) stay aligned. */
+static _Alignas(16) unsigned char stack[STACK_SIZE];
 static bool initialized[STACK_SIZE];
-static _Thread_local unsigned char teb[4096];
-static unsigned char peb[4096];
-static unsigned char iobuf[IOBUF_COUNT * IOBUF_ENTRY_SIZE];
+static _Thread_local _Alignas(16) unsigned char teb[4096];
+static _Alignas(16) unsigned char peb[4096];
+static _Alignas(16) unsigned char iobuf[IOBUF_COUNT * IOBUF_ENTRY_SIZE];
 static _Thread_local int guest_errno_storage;
-static unsigned char runtime_data[RUNTIME_DATA_SIZE];
-static _Thread_local unsigned char tls_storage[TLS_SIZE];
+static _Alignas(16) unsigned char runtime_data[RUNTIME_DATA_SIZE];
+static _Thread_local _Alignas(16) unsigned char tls_storage[TLS_SIZE];
 
 static int host_argc;
 static char **host_argv;
@@ -201,6 +207,16 @@ static uint64_t watched_rva = UINT64_MAX;
 
 uint64_t guest_load(uint64_t addr, uint32_t width);
 void guest_set_pc(uint64_t address) {
+    /* ARM64_RECOMPILER_PC_LOG=<file> records every traced guest PC (debugging aid). */
+    static FILE *pc_log;
+    static int pc_log_state;
+    if (!pc_log_state) {
+        const char *path = getenv("ARM64_RECOMPILER_PC_LOG");
+        pc_log = path ? fopen(path, "w") : NULL;
+        pc_log_state = 1;
+    }
+    if (pc_log)
+        fprintf(pc_log, "%llx\n", (unsigned long long)address);
     guest_pc = address;
     if (address == watched_rva) {
         fprintf(stderr, "Reached guest RVA %#llx\n", (unsigned long long)address);
@@ -213,7 +229,11 @@ void guest_trap(const char *message) {
     exit(125);
 }
 
+static void detach_guest_modules(void);
+
+/* ExitProcess: DLLs receive DLL_PROCESS_DETACH (Wine's CRT flushes stdio there). */
 void guest_exit(uint32_t status) {
+    detach_guest_modules();
     exit((int)status);
 }
 
@@ -321,8 +341,22 @@ static inline unsigned char *heap_span(uint64_t address, uint64_t size) {
     return subsys_mapping_span(address, size);
 }
 
+/*
+ * The process heap is 0x7fff2001; HeapCreate hands out further handles in the
+ * same range. All of them allocate from the host allocator.
+ */
+enum { GUEST_HEAP_HANDLE = 0x7fff2001, GUEST_HEAP_HANDLE_END = 0x7fff2200 };
+static _Atomic uint64_t guest_heap_next = GUEST_HEAP_HANDLE + 1;
+
+static bool guest_heap_handle(uint64_t handle) {
+    return handle >= GUEST_HEAP_HANDLE && handle < GUEST_HEAP_HANDLE_END;
+}
+
+/* HEAP_NO_SERIALIZE, HEAP_GENERATE_EXCEPTIONS, HEAP_ZERO_MEMORY. */
+#define GUEST_HEAP_FLAGS 0xdu
+
 uint64_t guest_heap_alloc(uint64_t handle, uint32_t flags, uint64_t size) {
-    if (handle != 0x7fff2001 || (flags & ~8u))
+    if (!guest_heap_handle(handle) || (flags & ~GUEST_HEAP_FLAGS))
         guest_trap("unsupported HeapAlloc handle or flags");
     if (!size)
         size = 1;
@@ -358,7 +392,7 @@ struct translated_module {
     struct translated_module *next;
 };
 static _Atomic(struct translated_module *) translated_modules;
-static pthread_mutex_t module_translation_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t module_translation_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
 static unsigned char *mapped_module_span(const struct guest_module *module,
                                           uint64_t address, uint64_t size, bool writable) {
@@ -589,13 +623,15 @@ static void init_guest_cpu(uint64_t *cpu) {
         cpu[CPU_WIDTH_OFFSET + GPR_COUNT + i * 2] = 128;
 }
 
-static uint32_t call_module_entry(struct guest_module *module, uint64_t reason) {
+static uint32_t call_module_entry_reserved(struct guest_module *module, uint64_t reason,
+                                           uint64_t reserved) {
     uint64_t cpu[128] = {0};
     uint64_t *caller = current_cpu;
     if (!caller)
         guest_trap("DLL initialization requires a guest CPU");
     cpu[1] = module->base;
     cpu[2] = reason;
+    cpu[3] = reserved;
     init_guest_cpu(cpu);
     cpu[7] = (caller[7] & ~UINT64_C(15)) - 40;
     guest_store(cpu[7], 0, 8);
@@ -605,16 +641,138 @@ static uint32_t call_module_entry(struct guest_module *module, uint64_t reason) 
     return (uint32_t)cpu[0];
 }
 
+static uint32_t call_module_entry(struct guest_module *module, uint64_t reason) {
+    return call_module_entry_reserved(module, reason, 0);
+}
+
+/* Attached modules in initialization order (dependencies first). */
+static struct guest_module *attached_modules[256];
+static size_t attached_module_count;
+
+static void forget_attached_module(struct guest_module *module) {
+    for (size_t i = attached_module_count; i > 0; --i)
+        if (attached_modules[i - 1] == module) {
+            memmove(&attached_modules[i - 1], &attached_modules[i],
+                    (attached_module_count - i) * sizeof *attached_modules);
+            --attached_module_count;
+            return;
+        }
+}
+
 static uint64_t load_application_module(const char *name);
 static void release_application_module(struct guest_module *module);
 
-static uint64_t module_export(const struct guest_module *module, const char *name, uint64_t ordinal) {
+/*
+ * API-set schema: contract DLL names map to their implementing DLL.
+ * api-ms-win-crt-* is ucrtbase.dll; core/security contracts are system code.
+ */
+static const char *resolve_api_set(const char *name, char *buffer, size_t size) {
+    if (!strncasecmp(name, "api-ms-win-crt-", 15))
+        return "ucrtbase.dll";
+    static const char *const system_prefixes[] = {
+        "api-ms-win-core-", "api-ms-win-security-", "api-ms-win-eventing-",
+        "api-ms-win-appmodel-", "ext-ms-win-",
+    };
+    for (size_t i = 0; i < sizeof system_prefixes / sizeof *system_prefixes; ++i)
+        if (!strncasecmp(name, system_prefixes[i], strlen(system_prefixes[i])))
+            return "kernelbase.dll";
+    const char *dot = strrchr(name, '.');
+    if (!dot || strcasecmp(dot, ".dll")) {
+        snprintf(buffer, size, "%s.dll", name);
+        return buffer;
+    }
+    return name;
+}
+
+/* DLLs the runtime implements with named shims (keep in sync with build_console_modules.py). */
+static bool is_system_dll_name(const char *name) {
+    static const char *const system[] = {
+        "kernel32.dll", "kernelbase.dll", "ntdll.dll", "advapi32.dll", "bcrypt.dll",
+        "ws2_32.dll", "user32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll",
+        "userenv.dll", "secur32.dll", "crypt32.dll", "shlwapi.dll", "dbghelp.dll",
+    };
+    char buffer[160];
+    const char *resolved = resolve_api_set(name, buffer, sizeof buffer);
+    for (size_t i = 0; i < sizeof system / sizeof *system; ++i)
+        if (!strcasecmp(resolved, system[i]))
+            return true;
+    return false;
+}
+
+/*
+ * Named system functions as call targets. A forwarded export such as
+ * "kernel32.GetCurrentThreadId" resolves to a token; guest_indirect_call
+ * dispatches it through the same named shims as a direct import.
+ */
+enum { SYSTEM_THUNK_BASE = 0x7fff8000, SYSTEM_THUNK_LIMIT = 0x4000 };
+static char *system_thunk_names[SYSTEM_THUNK_LIMIT];
+static size_t system_thunk_count;
+static pthread_mutex_t system_thunk_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t system_thunk(const char *name) {
+    pthread_mutex_lock(&system_thunk_lock);
+    size_t i = 0;
+    while (i < system_thunk_count && strcmp(system_thunk_names[i], name))
+        ++i;
+    if (i == system_thunk_count) {
+        char *copy = system_thunk_count < SYSTEM_THUNK_LIMIT ? strdup(name) : NULL;
+        if (!copy) {
+            pthread_mutex_unlock(&system_thunk_lock);
+            return 0;
+        }
+        system_thunk_names[system_thunk_count++] = copy;
+    }
+    pthread_mutex_unlock(&system_thunk_lock);
+    return SYSTEM_THUNK_BASE + i;
+}
+
+static const char *system_thunk_name(uint64_t target) {
+    if (target < SYSTEM_THUNK_BASE || target - SYSTEM_THUNK_BASE >= SYSTEM_THUNK_LIMIT)
+        return NULL;
+    pthread_mutex_lock(&system_thunk_lock);
+    const char *name = target - SYSTEM_THUNK_BASE < system_thunk_count
+                           ? system_thunk_names[target - SYSTEM_THUNK_BASE] : NULL;
+    pthread_mutex_unlock(&system_thunk_lock);
+    return name;
+}
+
+static uint64_t module_export_at(const struct guest_module *module, const char *name,
+                                 uint64_t ordinal, unsigned depth);
+
+/* Resolve "DLL.Name" or "DLL.#ordinal". The caller holds the loader lock. */
+static uint64_t resolve_forwarder(const char *forwarder, unsigned depth) {
+    const char *dot = strrchr(forwarder, '.');
+    if (depth > 8 || !dot || dot == forwarder || dot - forwarder >= 128 || !dot[1])
+        return 0;
+    char dll[128], buffer[160];
+    snprintf(dll, sizeof dll, "%.*s", (int)(dot - forwarder), forwarder);
+    const char *target = resolve_api_set(dll, buffer, sizeof buffer);
+    const char *symbol = dot + 1;
+    uint64_t ordinal = 0;
+    if (symbol[0] == '#') {
+        ordinal = strtoull(symbol + 1, NULL, 10);
+        symbol = NULL;
+    }
+    if (is_system_dll_name(target))
+        return symbol ? system_thunk(symbol) : 0;
+    uint64_t handle = load_application_module(target);
+    struct guest_module *module = handle ? find_guest_module(handle) : NULL;
+    return module ? module_export_at(module, symbol, ordinal, depth) : 0;
+}
+
+static uint64_t module_export_at(const struct guest_module *module, const char *name,
+                                 uint64_t ordinal, unsigned depth) {
     for (size_t i = 0; i < module->export_count; ++i) {
         const struct guest_module_export *export = &module->exports[i];
         if (name ? export->name && !strcmp(name, export->name) : ordinal == export->ordinal)
-            return export->address;
+            return export->forwarder ? resolve_forwarder(export->forwarder, depth + 1) : export->address;
     }
     return 0;
+}
+
+/* Look up an export by name, or by ordinal when name is NULL, following forwarders. */
+static uint64_t module_export(const struct guest_module *module, const char *name, uint64_t ordinal) {
+    return module_export_at(module, name, ordinal, 0);
 }
 
 static void release_module_dependencies(struct guest_module *module) {
@@ -632,6 +790,7 @@ static void release_application_module(struct guest_module *module) {
         --module->references;
         return;
     }
+    forget_attached_module(module);
     call_module_entry(module, 0);
     unmap_guest_module(module);
     release_module_dependencies(module);
@@ -689,11 +848,17 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
         }
         for (size_t i = 0; i < module->import_count; ++i) {
             const struct guest_module_import *import = &module->imports[i];
-            uint64_t handle = load_application_module(import->dll);
-            if (!handle)
-                goto fail;
-            module->dependencies[i] = handle;
-            uint64_t target = module_export(find_guest_module(handle), import->name, import->ordinal);
+            uint64_t target;
+            if (is_system_dll_name(import->dll)) {
+                /* Runtime-implemented DLL: the slot holds a named token. */
+                target = import->name ? system_thunk(import->name) : 0;
+            } else {
+                uint64_t handle = load_application_module(import->dll);
+                if (!handle)
+                    goto fail;
+                module->dependencies[i] = handle;
+                target = module_export(find_guest_module(handle), import->name, import->ordinal);
+            }
             unsigned char *slot = mapped_module_span(module, import->slot, sizeof target, false);
             if (!target || !slot) {
                 last_error = 127;
@@ -706,6 +871,8 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
         last_error = 1114;
         goto fail;
     }
+    if (attached_module_count < sizeof attached_modules / sizeof *attached_modules)
+        attached_modules[attached_module_count++] = module;
     module->loading = false;
     return module->base;
 
@@ -854,6 +1021,125 @@ static uint64_t load_application_module(const char *name) {
     return load_guest_module(module, module->name);
 }
 
+/*
+ * Process exit: DLL_PROCESS_DETACH with lpReserved non-NULL, in reverse
+ * initialization order. Runs once, even if a DllMain calls ExitProcess.
+ */
+static void detach_guest_modules(void) {
+    static bool detaching;
+    if (detaching || !current_cpu)
+        return;
+    detaching = true;
+    pthread_mutex_lock(&module_translation_lock);
+    while (attached_module_count) {
+        struct guest_module *module = attached_modules[--attached_module_count];
+        call_module_entry_reserved(module, 0, 1);
+    }
+    pthread_mutex_unlock(&module_translation_lock);
+}
+
+/* IAT slots (RVAs) the lifter routes through bound values; sorted. */
+__attribute__((weak)) const uint64_t guest_bound_import_slots[1] = {0};
+__attribute__((weak)) const uint64_t guest_bound_import_count = 0;
+
+static bool is_bound_import_slot(uint64_t rva) {
+    size_t low = 0, high = guest_bound_import_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (guest_bound_import_slots[mid] == rva)
+            return true;
+        if (guest_bound_import_slots[mid] < rva)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return false;
+}
+
+static void image_string(char *out, size_t size, uint64_t rva) {
+    size_t i = 0;
+    for (; i + 1 < size; ++i) {
+        char c = (char)guest_load(rva + i, 1);
+        if (!c)
+            break;
+        out[i] = c;
+    }
+    out[i] = 0;
+}
+
+/* The IAT may sit in a read-only section; the loader writes it directly. */
+static void image_write64(uint64_t rva, uint64_t value) {
+    for (uint64_t i = 0; i < guest_section_count; ++i)
+        if (fits(rva, 8, guest_sections[i].address, guest_sections[i].size)) {
+            memcpy(image[i] + (rva - guest_sections[i].address), &value, 8);
+            return;
+        }
+    guest_trap("import address table outside the image");
+}
+
+/*
+ * Bind the primary image's static imports from lifted guest DLLs, as the
+ * Windows loader does before the entry point: walk the import directory, map
+ * API-set contracts to their DLL, load each DLL (its dependencies load and
+ * receive DLL_PROCESS_ATTACH first, so attach runs bottom-up), and resolve each
+ * thunk by name or by ordinal (bit 63), following forwarders. Imports the
+ * lifter left on named shims are skipped.
+ */
+void guest_bind_imports(void) {
+    if (!guest_bound_import_count)
+        return;
+    uint64_t header = guest_load(0x3c, 4);
+    uint64_t directory = guest_load(header + 0x18 + 0x70 + 8, 4);
+    pthread_mutex_lock(&module_translation_lock);
+    for (uint64_t descriptor = directory; directory; descriptor += 20) {
+        uint64_t lookup = guest_load(descriptor, 4), name = guest_load(descriptor + 12, 4);
+        uint64_t first = guest_load(descriptor + 16, 4);
+        if (!name && !first)
+            break;
+        char dll[129], buffer[160];
+        image_string(dll, sizeof dll, name);
+        const char *target = resolve_api_set(dll, buffer, sizeof buffer);
+        struct guest_module *module = NULL;
+        for (uint64_t i = 0;; ++i) {
+            uint64_t slot = first + i * 8;
+            uint64_t entry = guest_load((lookup ? lookup : first) + i * 8, 8);
+            if (!entry)
+                break;
+            if (!is_bound_import_slot(slot))
+                continue;
+            if (!module) {
+                uint64_t handle = load_application_module(target);
+                module = handle ? find_guest_module(handle) : NULL;
+                if (!module) {
+                    fprintf(stderr, "The program can't start because %s (%s) is missing or failed to initialize.\n",
+                            dll, target);
+                    exit((int)0xc0000135 & 0xff); /* STATUS_DLL_NOT_FOUND */
+                }
+            }
+            char symbol[256];
+            uint64_t ordinal = 0;
+            if (entry >> 63)
+                ordinal = entry & 0xffff;
+            else
+                image_string(symbol, sizeof symbol, (entry & 0x7fffffff) + 2);
+            uint64_t address = module_export(module, ordinal ? NULL : symbol, ordinal);
+            if (!address) {
+                if (ordinal)
+                    snprintf(symbol, sizeof symbol, "#%llu", (unsigned long long)ordinal);
+                fprintf(stderr, "The procedure entry point %s could not be located in %s.\n", symbol, target);
+                exit((int)0xc0000139 & 0xff); /* STATUS_ENTRYPOINT_NOT_FOUND */
+            }
+            image_write64(slot, address);
+            if (getenv("ARM64_RECOMPILER_TRACE_IMPORTS")) {
+                if (ordinal)
+                    snprintf(symbol, sizeof symbol, "#%llu", (unsigned long long)ordinal);
+                fprintf(stderr, "[bind] %s!%s -> %s %#llx\n", dll, symbol, target, (unsigned long long)address);
+            }
+        }
+    }
+    pthread_mutex_unlock(&module_translation_lock);
+}
+
 static uint64_t load_named_module(const char *module, uint64_t reserved, uint32_t flags) {
     if (!reserved && (flags == 0 || flags == 0x800)) {
         uint64_t service = service_module(module);
@@ -939,9 +1225,11 @@ uint64_t guest_get_proc(uint64_t handle, uint64_t address) {
         snprintf(symbol, sizeof symbol, "#%llu", (unsigned long long)address);
     else
         module_string(symbol, sizeof symbol, address, 1);
+    pthread_mutex_lock(&module_translation_lock);
     struct guest_module *module = find_guest_module(handle);
+    uint64_t target = module ? module_export(module, address <= UINT16_MAX ? NULL : symbol, address) : 0;
+    pthread_mutex_unlock(&module_translation_lock);
     if (module) {
-        uint64_t target = module_export(module, address <= UINT16_MAX ? NULL : symbol, address);
         if (target)
             return target;
         last_error = 127;
@@ -1942,6 +2230,12 @@ uint64_t guest_punpcklwd(uint64_t d0, uint64_t s0, uint32_t lane) {
     } else {
         return (uint64_t)d[2] | ((uint64_t)s[2] << 16) | ((uint64_t)d[3] << 32) | ((uint64_t)s[3] << 48);
     }
+}
+
+/* movs/rep movs with DF clear: element-wise forward copy, so overlapping moves behave like x86. */
+void guest_move_string(uint64_t destination, uint64_t source, uint64_t count, uint32_t width) {
+    for (uint64_t i = 0; i < count; ++i)
+        guest_store(destination + i * width, guest_load(source + i * width, width), width);
 }
 
 uint64_t guest_fill(uint64_t destination, uint64_t count, uint64_t value, uint32_t width) {
@@ -3156,17 +3450,36 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
     if (target == 0x7fff3001) {
         return (uint64_t)guest_add_vectored_exception_handler((uint32_t)first, second);
     }
-    if (target < 0x20000000) {
+    const char *system_name = system_thunk_name(target);
+    if (target < 0x20000000 || system_name || module_span(target, 2, false)) {
         char name[128] = {0};
         bool valid = true;
-        for (size_t i = 0; i < sizeof(name) - 1; ++i) {
+        if (system_name)
+            snprintf(name, sizeof name, "%s", system_name);
+        for (size_t i = 0; !system_name && i < sizeof(name) - 1; ++i) {
             uint8_t c = (uint8_t)guest_load(target + 2 + i, 1);
             if (!c) { name[i] = 0; break; }
             if (c < 32 || c >= 127) { valid = false; break; }
             name[i] = (char)c;
         }
         if (valid && name[0]) {
+            static int trace_imports = -1;
+            if (trace_imports < 0)
+                trace_imports = getenv("ARM64_RECOMPILER_TRACE_IMPORTS") != NULL;
+            if (trace_imports)
+                fprintf(stderr, "[import] %s(%#llx, %#llx, %#llx, %#llx)\n", name,
+                        (unsigned long long)first, (unsigned long long)second,
+                        (unsigned long long)third, (unsigned long long)fourth);
             uint64_t shim_res = 0;
+            if (strcmp(name, "CreateFileW") == 0 || strcmp(name, "CreateFileA") == 0) {
+                uint64_t *regs = (uint64_t *)current_cpu;
+                uint64_t stack = regs ? regs[7] + 40 : 0;
+                uint32_t creation = stack ? (uint32_t)guest_load(stack, 4) : 3;
+                uint32_t flags = stack ? (uint32_t)guest_load(stack + 8, 4) : 0;
+                uint64_t template_file = stack ? guest_load(stack + 16, 8) : 0;
+                return (name[10] == 'W' ? subsys_CreateFileW : subsys_CreateFileA)(
+                    first, (uint32_t)second, (uint32_t)third, fourth, creation, flags, template_file);
+            }
             if (guest_dispatch_generated_shim(name, &shim_res, first, second, third, fourth))
                 return shim_res;
             if (strcmp(name, "GetModuleHandleA") == 0)
@@ -3178,6 +3491,23 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
             if (strcmp(name, "GetProcAddress") == 0)
                 return guest_get_proc(first, second);
             if (strcmp(name, "GetProcessHeap") == 0) return 0x7fff2001;
+            if (strcmp(name, "HeapCreate") == 0) {
+                uint64_t handle = atomic_fetch_add(&guest_heap_next, 1);
+                if (guest_heap_handle(handle))
+                    return handle;
+                last_error = 8;
+                return 0;
+            }
+            if (strcmp(name, "HeapDestroy") == 0) return guest_heap_handle(first) && first != GUEST_HEAP_HANDLE;
+            if (strcmp(name, "HeapSize") == 0) {
+                if (!guest_heap_handle(first) || (third & UINT64_C(0xFF00000000000000)) != GUEST_HEAP_TAG)
+                    return (uint64_t)-1;
+                return malloc_size((void *)(uintptr_t)(third & ~UINT64_C(0xFF00000000000000)));
+            }
+            if (strcmp(name, "HeapValidate") == 0 || strcmp(name, "HeapLock") == 0 ||
+                strcmp(name, "HeapUnlock") == 0 || strcmp(name, "HeapSetInformation") == 0)
+                return guest_heap_handle(first) || strcmp(name, "HeapSetInformation") == 0;
+            if (strcmp(name, "HeapCompact") == 0) return 0;
             if (strcmp(name, "HeapAlloc") == 0) return guest_heap_alloc(first, (uint32_t)second, third);
             if (strcmp(name, "HeapFree") == 0) return guest_heap_free(first, (uint32_t)second, third);
             if (strcmp(name, "HeapReAlloc") == 0) return guest_heap_realloc(first, (uint32_t)second, third, fourth);
@@ -3222,7 +3552,14 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
             }
             if (strcmp(name, "GetThreadPriority") == 0) return 0;
             if (strcmp(name, "SetThreadPriority") == 0) return 1;
-            if (strcmp(name, "TryEnterCriticalSection") == 0) return 1;
+            if (strcmp(name, "TryEnterCriticalSection") == 0) {
+                /* Take the section unless another thread owns it. */
+                uint64_t owner = guest_load(first + 16, 8);
+                if (owner && owner != guest_identity(1))
+                    return 0;
+                guest_critical_section(first, 1);
+                return 1;
+            }
             if (strcmp(name, "RaiseException") == 0) {
                 if (!current_cpu)
                     guest_trap("RaiseException requires a guest context");
@@ -3491,6 +3828,171 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
                 return guest_nt_read_file(first, second, third, fourth, args);
             }
 
+            /*
+             * Wine's PE DLLs (such as its ucrtbase.dll) log through ntdll's
+             * debug channels. Channels report as disabled and messages are
+             * dropped unless ARM64_RECOMPILER_WINE_DEBUG is set.
+             */
+            if (strcmp(name, "MultiByteToWideChar") == 0 || strcmp(name, "WideCharToMultiByte") == 0) {
+                /* Same conversion as the inline lowering; arguments 5 and 6 are on the stack. */
+                uint64_t *regs = (uint64_t *)current_cpu;
+                uint64_t stack = regs ? regs[7] + 40 : 0;
+                uint64_t dest = stack ? guest_load(stack, 8) : 0;
+                uint64_t size = stack ? guest_load(stack + 8, 4) : 0;
+                return guest_convert_text(name[0] == 'M', (uint32_t)first, (uint32_t)second,
+                                          third, (int32_t)fourth, dest, size);
+            }
+            if (strcmp(name, "GetVersionExW") == 0 || strcmp(name, "GetVersionExA") == 0) {
+                /* Windows 10 build 19045: dwMajor, dwMinor, dwBuild, dwPlatformId follow the size field. */
+                if (!first)
+                    return 0;
+                guest_store(first + 4, 10, 4);
+                guest_store(first + 8, 0, 4);
+                guest_store(first + 12, 19045, 4);
+                guest_store(first + 16, 2, 4);
+                guest_store(first + 20, 0, 2);
+                return 1;
+            }
+            if (strcmp(name, "GetEnvironmentStringsA") == 0) {
+                static const char environment[] = "SystemRoot=C:\\Windows\0";
+                uint64_t address = guest_heap_alloc(0x7fff2001, 0, sizeof environment);
+                for (size_t i = 0; address && i < sizeof environment; ++i)
+                    guest_store(address + i, (unsigned char)environment[i], 1);
+                return address;
+            }
+            if (strcmp(name, "FreeEnvironmentStringsA") == 0)
+                return guest_heap_free(0x7fff2001, 0, first);
+            if (strcmp(name, "GetModuleFileNameA") == 0) {
+                static const char module_name[] = "C:\\program.exe";
+                uint32_t size = (uint32_t)third;
+                if (first && first != guest_image_base) {
+                    last_error = 6;
+                    return 0;
+                }
+                if (!size) {
+                    last_error = 122;
+                    return 0;
+                }
+                size_t written = size < sizeof module_name ? size : sizeof module_name;
+                for (size_t i = 0; i + 1 < written; ++i)
+                    guest_store(second + i, (unsigned char)module_name[i], 1);
+                guest_store(second + written - 1, 0, 1);
+                if (written < sizeof module_name) {
+                    last_error = 122;
+                    return size;
+                }
+                return written - 1;
+            }
+            if (strcmp(name, "SetConsoleCtrlHandler") == 0)
+                return 1;
+            if (strcmp(name, "NtQuerySystemTime") == 0) {
+                guest_system_filetime(first);
+                return 0;
+            }
+            if (strcmp(name, "GetCommandLineW") == 0 || strcmp(name, "GetCommandLineA") == 0)
+                return guest_command_line(name[14] == 'W');
+            if (strcmp(name, "SetStdHandle") == 0)
+                return 1;
+            if (strcmp(name, "GetStartupInfoA") == 0) {
+                guest_startup_info(first); /* same layout and zero fields as the W form */
+                return 0;
+            }
+            if (strcmp(name, "IsBadStringPtrA") == 0 || strcmp(name, "IsBadStringPtrW") == 0)
+                return first == 0;
+            if (strcmp(name, "GetUserDefaultLocaleName") == 0) {
+                static const char locale[] = "en-US";
+                if ((uint32_t)second < sizeof locale) {
+                    last_error = 122;
+                    return 0;
+                }
+                for (size_t i = 0; i < sizeof locale; ++i)
+                    guest_store(first + i * 2, (unsigned char)locale[i], 2);
+                return sizeof locale;
+            }
+            if (strcmp(name, "LocaleNameToLCID") == 0)
+                return 0x409; /* every locale name maps to en-US */
+            if (strcmp(name, "LCMapStringW") == 0 || strcmp(name, "LCMapStringEx") == 0) {
+                /* Case mapping (LCMAP_LOWERCASE/UPPERCASE) or a plain copy for ASCII text. */
+                uint64_t *regs = (uint64_t *)current_cpu;
+                uint64_t stack = regs ? regs[7] + 40 : 0;
+                bool ex = name[11] == 'E';
+                uint32_t flags = (uint32_t)second;
+                uint64_t source = third;
+                int32_t length = (int32_t)fourth;
+                uint64_t dest = stack ? guest_load(stack, 8) : 0;
+                int32_t size = stack ? (int32_t)guest_load(stack + 8, 4) : 0;
+                (void)ex;
+                if (!source || flags & ~0x0f000300u || length == 0 || length < -1) {
+                    last_error = 87;
+                    return 0;
+                }
+                if (length == -1) {
+                    for (length = 0; guest_load(source + (uint64_t)length * 2, 2); ++length) {}
+                    ++length;
+                }
+                if (!size)
+                    return (uint64_t)length;
+                if (size < length) {
+                    last_error = 122;
+                    return 0;
+                }
+                for (int32_t i = 0; i < length; ++i) {
+                    unsigned c = (unsigned)guest_load(source + (uint64_t)i * 2, 2);
+                    if (c < 128 && (flags & 0x100)) c = (unsigned)tolower((int)c);
+                    if (c < 128 && (flags & 0x200)) c = (unsigned)toupper((int)c);
+                    guest_store(dest + (uint64_t)i * 2, c, 2);
+                }
+                return (uint64_t)length;
+            }
+            if (strcmp(name, "GetStringTypeW") == 0) {
+                /* CT_CTYPE1 only; non-ASCII characters report C1_DEFINED | C1_ALPHA. */
+                if ((uint32_t)first != 1 || !second || !fourth) {
+                    last_error = 87;
+                    return 0;
+                }
+                int32_t count = (int32_t)third;
+                if (count == -1)
+                    for (count = 0; guest_load(second + (uint64_t)count * 2, 2); ++count) {}
+                for (int32_t i = 0; i < count; ++i) {
+                    unsigned c = (unsigned)guest_load(second + (uint64_t)i * 2, 2);
+                    unsigned type = 0x200;
+                    if (c < 128) {
+                        if (isupper((int)c)) type |= 0x1 | 0x100;
+                        if (islower((int)c)) type |= 0x2 | 0x100;
+                        if (isdigit((int)c)) type |= 0x4;
+                        if (isspace((int)c)) type |= 0x8;
+                        if (ispunct((int)c)) type |= 0x10;
+                        if (iscntrl((int)c)) type |= 0x20;
+                        if (c == ' ' || c == '\t') type |= 0x40;
+                        if (isxdigit((int)c)) type |= 0x80;
+                        if (!c) type = 0x20 | 0x200;
+                    } else {
+                        type |= 0x100;
+                    }
+                    guest_store(fourth + (uint64_t)i * 2, type, 2);
+                }
+                return 1;
+            }
+            if (strcmp(name, "__wine_dbg_get_channel_flags") == 0)
+                return getenv("ARM64_RECOMPILER_WINE_DEBUG") ? 0x0f : 0;
+            if (strcmp(name, "__wine_dbg_header") == 0)
+                return getenv("ARM64_RECOMPILER_WINE_DEBUG") ? 0 : (uint64_t)(int64_t)-1;
+            if (strcmp(name, "__wine_dbg_strdup") == 0)
+                return first;
+            if (strcmp(name, "__wine_dbg_output") == 0) {
+                size_t length = 0;
+                while (first && length < 4096 && guest_load(first + length, 1))
+                    ++length;
+                if (getenv("ARM64_RECOMPILER_WINE_DEBUG"))
+                    for (size_t i = 0; i < length; ++i)
+                        fputc((int)guest_load(first + i, 1), stderr);
+                return length;
+            }
+            if (strcmp(name, "_vsnprintf") == 0) {
+                int length = subsys_stdio_common_vsprintf(0, first, second, third, fourth);
+                return (uint64_t)(int64_t)((uint64_t)length >= second ? -1 : length);
+            }
+
             return guest_unimplemented_stub(name, "wine_api");
         }
     }
@@ -3655,7 +4157,9 @@ uint64_t guest_qsort(uint64_t base, uint64_t num, uint64_t width, uint64_t compa
 uint64_t guest_identity(uint32_t thread);
 
 void guest_init_critical(uint64_t address, uint32_t spin_count) {
-    guest_store(address, 0, 8);
+    /* Like Windows, give every section a zeroed RTL_CRITICAL_SECTION_DEBUG
+       block; Wine's CRT writes DebugInfo->Spare[0] right after initializing. */
+    guest_store(address, guest_heap_alloc(0x7fff2001, 8, 0x30), 8);
     guest_store(address + 8, UINT32_MAX, 8);
     guest_store(address + 16, 0, 8);
     guest_store(address + 24, 0, 8);
@@ -3732,6 +4236,7 @@ void guest_critical_section(uint64_t address, uint32_t entering) {
     if (entering == 2) {
         if (depth || owner)
             guest_trap("cannot delete an owned critical section");
+        guest_heap_free(0x7fff2001, 0, guest_load(address, 8));
         for (unsigned offset = 0; offset < 40; offset += 8)
             guest_store(address + offset, 0, 8);
         return;
@@ -4419,15 +4924,18 @@ uint64_t guest_environment(void) {
 
 uint64_t guest_convert_text(uint32_t wide, uint32_t page, uint32_t flags,
                             uint64_t source, int32_t length, uint64_t dest, uint64_t size) {
+    /* Every code page converts unit by unit, which is exact for ASCII text. */
     (void)flags;
-    if ((page != 0 && page != 65001 && page != 1252 && page != 437) ||
-        length < -1 || length == 0 || length > 65536 || size > INT32_MAX)
-        guest_trap("unsupported Windows text conversion parameters");
+    (void)page;
+    if (length < -1 || length == 0 || size > INT32_MAX) {
+        last_error = 87; /* ERROR_INVALID_PARAMETER, as Windows reports */
+        return 0;
+    }
     unsigned in_width = wide ? 1 : 2;
     unsigned out_width = wide ? 2 : 1;
     uint64_t count = 0;
     while (length == -1 || count < (uint32_t)length) {
-        if (count == 65536)
+        if (length == -1 && count == 16 * 1024 * 1024)
             guest_trap("unterminated Windows text conversion input");
         uint64_t unit = guest_load(source + count * in_width, in_width);
         ++count;
@@ -4533,6 +5041,7 @@ int main(int argc, char **argv) {
     host_argv = argv;
     init_runtime_data();
     put64(peb, 0x10, guest_image_base);
+    put64(peb, 0x30, 0x7fff2001); /* ProcessHeap, read directly by Wine's CRT */
     image = calloc(guest_section_count ? guest_section_count : 1, sizeof *image);
     section_protection = calloc(guest_section_count ? guest_section_count : 1, sizeof *section_protection);
     if (!image || !section_protection)

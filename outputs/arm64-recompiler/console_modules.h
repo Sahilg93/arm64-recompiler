@@ -18,6 +18,7 @@ struct guest_dispatch_entry {
 struct guest_module_export {
     const char *name;
     uint64_t ordinal, address;
+    const char *forwarder; /* "DLL.Name" or "DLL.#ordinal" when address is 0 */
 };
 
 struct guest_module_import {

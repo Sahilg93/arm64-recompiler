@@ -26,10 +26,11 @@ Exercises 11,121 arithmetic & control-flow instruction permutations, atomic `loc
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/run.sh
 ```
-It also runs the virtual-memory test (`test_mmap.c`) and three fixtures:
+It also runs the virtual-memory test (`test_mmap.c`) and four fixtures:
 - `fixtures/vm_fault`: raw `VirtualAlloc` faults reach VEH and table-driven SEH handlers, including a resumption in the middle of a function.
 - `fixtures/jit`: runtime-generated code in `PAGE_EXECUTE*` buffers runs in the fallback x86 interpreter, plus RWX patching and DEP faults.
 - `fixtures/exception/test_msvc.sh`: MSVC C++ EH and `__try`/`__except`.
+- `fixtures/crt`: Wine's real x64 `ucrtbase.dll` is lifted and loaded in place of the runtime's CRT shims. This covers API sets, ordinal imports, forwarded exports, and `DllMain` attach/detach order. It needs the same SDK tools as the MSVC case, plus a `ucrtbase.dll` from Wine.
 
 The fixtures compare against Wine when it is installed (`setup_wine.py`, or `WINE`/`WINEPREFIX`). The MSVC case needs an xwin SDK (`XWIN_SDK`) and LLVM `clang-cl`/`lld-link`. Without them it prints `SKIP`, or fails if `REQUIRE_MSVC=1`.
 

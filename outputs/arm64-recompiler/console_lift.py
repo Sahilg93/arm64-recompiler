@@ -63,9 +63,17 @@ def imported_calls(image):
 
 
 class ConsoleLift(Lift):
-    def __init__(self, image, *, trace=False, callback_targets=None, stub_unknown=True, modules=False, fault_delivery=False):
+    def __init__(self, image, *, trace=False, callback_targets=None, stub_unknown=True, modules=False,
+                 fault_delivery=False, tolerant=False, bound_dlls=None):
         super().__init__()
         self.trace = trace
+        # Tolerant lifting turns undecodable or unsupported instructions into
+        # runtime traps (like trace mode) without per-instruction PC updates.
+        self.tolerant = tolerant or trace
+        # Lowercase import DLL names whose IAT slots the runtime loader binds to
+        # lifted guest modules. Calls through those slots dispatch to the bound
+        # value; other imports use the runtime's named shims.
+        self.bound_dlls = None if bound_dlls is None else {name.lower() for name in bound_dlls}
         self.fault_delivery = fault_delivery
         self.resume_sites = set()
         self.stub_unknown = stub_unknown
@@ -97,9 +105,11 @@ class ConsoleLift(Lift):
         self.foreign_iat = {
             item.address - self.image_base
             for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ())
-            if dll.dll.lower() != b"kernel32.dll"
+            if (dll.dll.decode("ascii", "replace").lower() in self.bound_dlls
+                if self.bound_dlls is not None else dll.dll.lower() != b"kernel32.dll")
             for item in dll.imports
         }
+        self.bound_slots = sorted(self.foreign_iat) if self.bound_dlls else []
         self.iat_thunks = {}
         self.foreign_thunks = {}
         for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ()):
@@ -738,6 +748,19 @@ class ConsoleLift(Lift):
             self.store("i64", res_bits, "xmm0_0")
             self.store("i64", "0", "xmm0_1")
             result = None
+        elif name in {"CreateFileW", "CreateFileA"}:
+            # Seven arguments: creation disposition, flags, and template are on the stack.
+            registers = [self.read_reg("rcx", 64), self.read_reg("rdx", 32),
+                         self.read_reg("r8", 32), self.read_reg("r9", 64)]
+            stack = self.read_reg("rsp", 64)
+            offset = 40 if tail else 32
+            slots = [self.value(f"add i64 {stack}, {offset + i * 8}") for i in range(3)]
+            creation, flags, template = (self.value(f"call i64 @guest_load(i64 {slot}, i32 {width})")
+                                         for slot, width in zip(slots, (4, 4, 8)))
+            creation, flags = (self.value(f"trunc i64 {value} to i32") for value in (creation, flags))
+            result = self.value(
+                f"call i64 @subsys_{name}(i64 {registers[0]}, i32 {registers[1]}, i32 {registers[2]}, "
+                f"i64 {registers[3]}, i32 {creation}, i32 {flags}, i64 {template})")
         elif name in GENERATED_SHIMS:
             arg0 = self.read_reg("rcx", 64)
             arg1 = self.read_reg("rdx", 64)
@@ -1128,7 +1151,7 @@ class ConsoleLift(Lift):
             non_iat_mem = (operand.type == x.X86_OP_MEM and rip_slot not in self.iat_labels
                            and rip_slot not in self.imports)
             if (operand.type == x.X86_OP_REG or cfg_call or non_iat_mem
-                    or (self.module_base and rip_slot in self.foreign_iat)):
+                    or ((self.module_base or self.bound_dlls) and rip_slot in self.foreign_iat)):
                 target = self.read_reg("rax", 64) if cfg_call else self.read(ins, operand, 64)
                 self.guarded_call(ins, target, following, returns)
                 return
@@ -1235,6 +1258,23 @@ class ConsoleLift(Lift):
             end = self.value(f"call i64 @guest_fill(i64 {dest}, i64 {count}, i64 {wide}, i32 {width})")
             self.write_reg("rdi", 64, end)
             self.write_reg("rcx", 64, "0")
+            self.jump(following, returns)
+            return
+        string_moves = {"movsb": 1, "movsw": 2, "movsd": 4, "movsq": 8}
+        plain = op.removeprefix("rep ")
+        if (plain in string_moves and len(args) == 2
+                and args[0].type == args[1].type == x.X86_OP_MEM):
+            # movs with DF clear: copy forward from [rsi] to [rdi] and advance both.
+            width = string_moves[plain]
+            dest = self.read_reg("rdi", 64)
+            source = self.read_reg("rsi", 64)
+            count = self.read_reg("rcx", 64) if op.startswith("rep ") else "1"
+            self.line(f"  call void @guest_move_string(i64 {dest}, i64 {source}, i64 {count}, i32 {width})")
+            size = self.value(f"mul i64 {count}, {width}")
+            self.write_reg("rdi", 64, self.value(f"add i64 {dest}, {size}"))
+            self.write_reg("rsi", 64, self.value(f"add i64 {source}, {size}"))
+            if op.startswith("rep "):
+                self.write_reg("rcx", 64, "0")
             self.jump(following, returns)
             return
         if op == "xgetbv":
@@ -1932,9 +1972,29 @@ class ConsoleLift(Lift):
                     prior_negative = self.load("i1", "sf")
                     negative = self.value(f"select i1 {unchanged}, i1 {prior_negative}, i1 {negative}")
                 self.store("i1", negative, "sf")
-                self.store("i1", negative, "signed_less")
                 self.signed = self.signed or args[1].type == x.X86_OP_IMM
                 self.carry = self.overflow = False
+                shift = int(count) if args[1].type == x.X86_OP_IMM else 0
+                if shift and (op != "shl" or shift <= width):
+                    # CF is the last bit shifted out; OF is defined for one-bit shifts.
+                    bit = width - shift if op == "shl" else shift - 1
+                    source = previous if shift_width == width else self.value(
+                        f"trunc i{shift_width} {previous} to i{width}")
+                    carry = self.value(f"trunc i{width} " + self.value(
+                        f"lshr i{width} {source}, {bit}") + " to i1")
+                    if op == "shl":
+                        overflow = self.value(f"xor i1 {negative}, {carry}")
+                    elif op == "shr":
+                        overflow = self.value(f"icmp slt i{width} {source}, 0")
+                    else:
+                        overflow = "false"
+                    self.store("i1", carry, "cf")
+                    self.store("i1", overflow, "of")
+                    self.store("i1", self.value(f"xor i1 {negative}, {overflow}"), "signed_less")
+                    self.carry = True
+                    self.overflow = shift == 1
+                else:
+                    self.store("i1", negative, "signed_less")
                 self.write(ins, args[0], value)
         elif op in {"shld", "shrd"} and width in (16, 32, 64):
             dest_val = self.read(ins, args[0], width)
@@ -2292,6 +2352,9 @@ class ConsoleLift(Lift):
         self.line("declare double @llvm.maxnum.f64(double, double)")
         self.line("declare double @llvm.minnum.f64(double, double)")
         self.line("declare i64 @guest_fill(i64, i64, i64, i32)")
+        self.line("declare void @guest_move_string(i64, i64, i64, i32)")
+        for name in ("subsys_CreateFileW", "subsys_CreateFileA"):
+            self.line(f"declare i64 @{name}(i64, i32, i32, i64, i32, i32, i64)")
         self.line("declare i64 @guest_load(i64, i32)")
         self.line("declare void @guest_store(i64, i64, i32)")
         self.line("declare void @guest_check_return(i64, i64)")
@@ -2405,6 +2468,10 @@ class ConsoleLift(Lift):
             self.line(f"  store i8 128, ptr %xmm{index}_0_width")
         initial = 0x2000000 + 1048576 - 40
         self.write_reg("rsp", 64, str(initial))
+        if self.bound_slots:
+            # Load and attach statically imported guest DLLs before TLS callbacks and the entry point.
+            self.line(f"  call void @guest_store(i64 {initial}, i64 0, i32 8)")
+            self.line("  call void @guest_bind_imports()")
         for cb in self.tls_callbacks:
             self.write_reg("rcx", 64, str(self.image_base))
             self.write_reg("rdx", 64, "1")
@@ -2454,7 +2521,7 @@ class ConsoleLift(Lift):
                 self.functions[raw_val] = fn_name
                 self.line(f"define internal void @{fn_name}(ptr %cpu, i64 %return_va) {{")
                 self.line("entry:")
-                if self.module_base and raw_val in self.foreign_thunks:
+                if (self.module_base or self.bound_dlls) and raw_val in self.foreign_thunks:
                     slot = self.module_base + self.foreign_thunks[raw_val]
                     self.line(f"  %target = call i64 @guest_load(i64 {slot}, i32 8)")
                     self.line("  call i64 @guest_indirect_dispatch(ptr %cpu, i64 %target, i64 %return_va, i32 1)")
@@ -2586,21 +2653,21 @@ class ConsoleLift(Lift):
                 offset = address - base
                 if not 0 <= offset < len(code):
                     message = f"console target outside entry section at RVA {address:#x}"
-                    if not self.trace:
+                    if not self.tolerant:
                         raise ValueError(message)
                     self.trap(message)
                     continue
                 ins = next(decoder.disasm(code[offset:offset + 15], address, count=1), None)
                 if ins is None:
                     message = f"cannot decode console target RVA {address:#x}"
-                    if not self.trace:
+                    if not self.tolerant:
                         raise ValueError(message)
                     self.trap(message)
                     continue
                 instruction_bytes = range(address, address + ins.size)
                 if any(self.occupied.get(byte, address) != address for byte in instruction_bytes):
                     message = f"overlapping console instructions at RVA {address:#x}"
-                    if not self.trace:
+                    if not self.tolerant:
                         raise ValueError(message)
                     self.trap(message)
                     continue
@@ -2617,7 +2684,7 @@ class ConsoleLift(Lift):
                 self.step(ins, returns)
             except ValueError as error:
                 message = f"RVA {ins.address:#x} ({ins.mnemonic} {ins.op_str}): {error}"
-                if not self.trace:
+                if not self.tolerant:
                     raise ValueError(message) from error
                 del self.lines[checkpoint:]
                 self.trap(message)
@@ -2632,6 +2699,11 @@ class ConsoleLift(Lift):
         table_items = [f"{{ i64, ptr }} {{ i64 {addr + self.module_base}, ptr @{self.functions[addr]} }}" for addr in entries]
         self.line(f"@{prefix}guest_dispatch_table = constant {table_kind} [{', '.join(table_items)}]")
         self.line(f"@{prefix}guest_dispatch_count = constant i64 {len(entries)}")
+        if self.bound_slots and not self.module_base:
+            self.line("declare void @guest_bind_imports()")
+            slots = ", ".join(f"i64 {slot}" for slot in self.bound_slots)
+            self.line(f"@guest_bound_import_slots = constant [{len(self.bound_slots)} x i64] [{slots}]")
+            self.line(f"@guest_bound_import_count = constant i64 {len(self.bound_slots)}")
         for message, symbol in self.traps.items():
             data = message.encode() + b"\0"
             content = "".join(f"\\{byte:02x}" for byte in data)
