@@ -16,6 +16,10 @@ int main(void) {
     for (size_t i = 0; i < sizeof kernel; ++i)
         guest_store(address + 2 * i, kernel[i], 2);
     assert(guest_module_handle(address, 1) == KERNEL_MODULE);
+    unsigned references = kernel_references;
+    uint64_t handle = guest_load_library(address, 0, 0);
+    assert(handle == KERNEL_MODULE && kernel_references == references + 1);
+    assert(guest_free_library(handle) && kernel_references == references);
     guest_store(address, 'X', 2);
     assert(!guest_module_handle(address, 1) && guest_get_last_error() == 126);
 }

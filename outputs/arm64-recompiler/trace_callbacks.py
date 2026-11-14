@@ -10,7 +10,7 @@ import sys
 
 import pefile
 
-from console_lift import ConsoleLift, loader_requirements, read_console_image, relocated_code_pointers
+from console_lift import ConsoleLift, find_switch_tables, loader_requirements, read_console_image, relocated_code_pointers
 
 ROOT = Path(__file__).resolve().parent
 INDIRECT = re.compile(r"RVA (0x[0-9a-f]+): unsupported indirect call target (0x[0-9a-f]+)")
@@ -27,7 +27,7 @@ def trace(path, arguments, max_attempts):
     eligible.update(row.struct.BeginAddress
                     for row in getattr(image, "DIRECTORY_ENTRY_EXCEPTION", ())
                     if code.contains_rva(row.struct.BeginAddress))
-    targets = {}
+    targets = find_switch_tables(image)
     with tempfile.TemporaryDirectory() as folder:
         ir = Path(folder) / "startup.ll"
         native = Path(folder) / "startup"
@@ -35,7 +35,7 @@ def trace(path, arguments, max_attempts):
             ir.write_text(ConsoleLift(image, trace=True, callback_targets=targets).emit_console(*source))
             subprocess.run(["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
                             str(ir), str(ROOT / "console_runtime.c"), "-o", str(native)],
-                           check=True, timeout=60)
+                           check=True, timeout=180)
             result = subprocess.run([str(native), *arguments], capture_output=True,
                                     text=True, timeout=10)
             diagnostics = result.stderr.strip().splitlines()

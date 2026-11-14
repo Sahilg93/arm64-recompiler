@@ -35,14 +35,47 @@ PYTHON="$PWD/work/venv/bin/python3" \
 ```
 With automatic `.pdata` function discovery, this succeeds on **attempt 0**, printing `plink: Release 0.83` and exiting with status 0.
 
-### 3. Trace Startup of Corpus Binaries
+### 3. Build and Verify jq 1.8.2
+
+From the repository root on Apple Silicon, use the Python environment above
+and a matching LLVM 22 Clang and `llvm-link`. Set `LLVM_BIN` to their bin
+directory if LLVM is installed outside `/opt/homebrew/opt/llvm@22/bin`.
+The parity test takes the [macOS ARM64 jq 1.8.2 release](https://github.com/jqlang/jq/releases/tag/jq-1.8.2)
+as its reference. If you need to set up the Python environment, create it with
+`python3 -m venv work/venv` and install dependencies with
+`work/venv/bin/python3 -m pip install -r outputs/arm64-recompiler/requirements.txt`.
+
+```sh
+PYTHON="$PWD/work/venv/bin/python3" \
+  outputs/arm64-recompiler/build_jq.sh work/corpus/jq.exe work/build/jq-arm64
+curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64 \
+  -o work/build/jq-reference
+chmod +x work/build/jq-reference
+work/venv/bin/python3 outputs/arm64-recompiler/test_jq.py work/build/jq-arm64 work/build/jq-reference
+```
+
+The test checks stdout, stderr, and exit codes for stdin, file input, Unicode
+filenames, sorting, regex, malformed JSON, and jq's `-e` behavior.
+
+### 4. Verify Runtime DLL Loading
+
+The fixture builds a Windows EXE and DLL, recompiles them to ARM64, and checks
+runtime loading, named exports, callbacks, thread-local storage, and unload
+on the main thread and on a worker thread. Run from the repository root:
+
+```sh
+PYTHON="$PWD/work/venv/bin/python3" \
+  outputs/arm64-recompiler/fixtures/dynamic_dll/test.sh
+```
+
+### 5. Trace Startup of Corpus Binaries
 Trace native execution and inspect the stopping point for other Windows binaries:
 ```sh
-# jq 1.7.1
+# jq 1.8.2
 $PWD/work/venv/bin/python3 outputs/arm64-recompiler/trace_callbacks.py --max-attempts 1 work/corpus/jq.exe --version
 
 # ripgrep 14.1.1
-$PWD/work/venv/bin/python3 outputs/arm64-recompiler/trace_callbacks.py --max-attempts 1 work/corpus/rg.exe --version
+$PWD/work/venv/bin/python3 outputs/arm64-recompiler/run_exe.py --trace work/corpus/rg.exe --threads 1 --no-config --no-heading --sort path -n PATTERN DIRECTORY
 ```
 
 ---
@@ -87,8 +120,8 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 | --- | --- | --- |
 | **`plink.exe`** (0.83) | **Fully functional (`-V`)** | Prints `plink: Release 0.83` and exits 0 on attempt 0. |
 | **`gui_showcase.exe`** | **Fully functional (Hybrid GUI)** | Executes Win32 `MessageBoxA` natively on macOS, displaying alert and exiting 0. |
-| **`jq.exe`** (1.7.1) | Advanced past UCRT startup, heap, atomics & `___chkstk_ms` | Reaches `api-ms-win-crt-environment-l1-1-0.dll!__p__wenviron` (RVA `0x8dc28`). |
-| **`rg.exe`** (14.1.1) | Advanced past exception handlers, stack guarantee & pseudo-handles | Reaches TEB TLS vector lookup `mov rcx, gs:[0x58]` (RVA `0x1046c0`). |
+| **`jq.exe`** (1.8.2) | Runs real jq workloads | Verified for stdin, file input, sorting, regex, and error handling. See the jq parity test above. |
+| **`rg.exe`** (14.1.1) | Completes a single-threaded recursive search via the launcher in diagnostic mode | Both expected matches and exit status agree with Wine using `--no-heading --sort path`. |
 
 ---
 

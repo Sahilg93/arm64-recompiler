@@ -1,0 +1,479 @@
+{
+  "float_1arg": [
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atanh",
+    "cbrt",
+    "ceil",
+    "cos",
+    "cosh",
+    "erf",
+    "erfc",
+    "exp",
+    "exp2",
+    "expm1",
+    "fabs",
+    "floor",
+    "lgamma",
+    "log",
+    "log10",
+    "log1p",
+    "log2",
+    "nearbyint",
+    "rint",
+    "round",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "tgamma",
+    "trunc"
+  ],
+  "float_2arg": [
+    "atan2",
+    "copysign",
+    "fdim",
+    "fmax",
+    "fmin",
+    "fmod",
+    "hypot",
+    "pow",
+    "remainder"
+  ],
+  "passthrough": [
+    "abs",
+    "atoi",
+    "clock",
+    "difftime",
+    "isblank",
+    "iscntrl",
+    "isdigit",
+    "isgraph",
+    "islower",
+    "isprint",
+    "ispunct",
+    "isupper",
+    "isxdigit",
+    "labs",
+    "llabs",
+    "rand",
+    "srand",
+    "time",
+    "tolower",
+    "toupper"
+  ],
+  "stubs": [
+    {
+      "name": "SetConsoleMode",
+      "ret": "u32",
+      "val": 1,
+      "comment": "Accept standard console modes silently"
+    },
+    {
+      "name": "EventRegister",
+      "ret": "u32",
+      "val": 0,
+      "comment": "ETW telemetry registration stub (ERROR_SUCCESS)"
+    },
+    {
+      "name": "EventUnregister",
+      "ret": "u32",
+      "val": 0,
+      "comment": "ETW telemetry unregister stub"
+    },
+    {
+      "name": "EventWrite",
+      "ret": "u32",
+      "val": 0,
+      "comment": "ETW event emit stub"
+    },
+    {
+      "name": "EncodePointer",
+      "ret": "u64",
+      "val": "arg0",
+      "comment": "Identity pointer obfuscation"
+    },
+    {
+      "name": "DecodePointer",
+      "ret": "u64",
+      "val": "arg0",
+      "comment": "Identity pointer deobfuscation"
+    },
+    {
+      "name": "SwitchToThread",
+      "ret": "u32",
+      "val": 1,
+      "comment": "Yield execution"
+    },
+    {
+      "name": "__setusermatherr",
+      "ret": "u32",
+      "val": 0
+    },
+    {
+      "name": "_configthreadlocale",
+      "ret": "u32",
+      "val": 0
+    },
+    {
+      "name": "___lc_codepage_func",
+      "ret": "u32",
+      "val": 65001
+    },
+    {
+      "name": "_setmode",
+      "ret": "u32",
+      "val": 0
+    }
+  ],
+  "adapters": [
+    {
+      "name": "rand_s",
+      "params": [
+        "u64 ptr"
+      ],
+      "ret": "u32",
+      "code": "if (arg0) { uint32_t val = arc4random(); guest_store(arg0, val, 4); } return 0;"
+    },
+    {
+      "name": "_isatty",
+      "params": [
+        "u32 fd"
+      ],
+      "ret": "u32",
+      "code": "return isatty((int)arg0);"
+    },
+    {
+      "name": "_get_osfhandle",
+      "params": [
+        "u32 fd"
+      ],
+      "ret": "u64",
+      "code": "return (uint64_t)arg0;"
+    },
+    {
+      "name": "_fileno",
+      "params": [
+        "u64 stream"
+      ],
+      "ret": "u32",
+      "code": "return (uint32_t)arg0;"
+    },
+    {
+      "name": "Sleep",
+      "params": [
+        "u32 ms"
+      ],
+      "ret": "void",
+      "code": "usleep((useconds_t)arg0 * 1000); return 0;"
+    },
+    {
+      "name": "SleepEx",
+      "params": [
+        "u32 ms",
+        "u32 alertable"
+      ],
+      "ret": "u32",
+      "code": "(void)arg1; usleep((useconds_t)arg0 * 1000); return 0;"
+    },
+    {
+      "name": "GetConsoleMode",
+      "params": [
+        "u64 handle",
+        "u64 mode_ptr"
+      ],
+      "ret": "u32",
+      "code": "if (arg1) { guest_store(arg1, 0x0007, 4); } return 1;"
+    },
+    {
+      "name": "WriteConsoleW",
+      "params": [
+        "u64 hConsole",
+        "u64 lpBuffer",
+        "u32 nChars",
+        "u64 lpWritten",
+        "u64 lpReserved"
+      ],
+      "ret": "u32",
+      "code": "{\n    (void)arg0;\n    uint32_t count = (uint32_t)arg2;\n    for (uint32_t i = 0; i < count; ++i) {\n        uint16_t ch = (uint16_t)guest_load(arg1 + i * 2, 2);\n        if (ch < 128) putchar((char)ch);\n        else putchar('?');\n    }\n    if (arg3) guest_store(arg3, count, 4);\n    return 1;\n}"
+    },
+    {
+      "name": "GetCPInfo",
+      "params": [
+        "u32 code_page",
+        "u64 cp_info_ptr"
+      ],
+      "ret": "u32",
+      "code": "if (arg1) {\n    guest_store(arg1, 1, 4); /* MaxCharSize = 1 */\n    guest_store(arg1 + 4, 0x3f, 2); /* DefaultChar = '?' */\n}\nreturn 1;"
+    },
+    {
+      "name": "RaiseException",
+      "params": [
+        "u32 code",
+        "u32 flags",
+        "u32 count",
+        "u64 args"
+      ],
+      "ret": "void",
+      "code": "fprintf(stderr, \"[RAISE_EXCEPTION] Code=%#x Flags=%#x\\n\", (uint32_t)arg0, (uint32_t)arg1); return 0;"
+    },
+    {
+      "name": "GetSystemInfo",
+      "params": [
+        "u64 sysinfo_ptr"
+      ],
+      "ret": "void",
+      "code": "if (arg0) {\n    for (unsigned o = 0; o < 48; o += 8) guest_store(arg0 + o, 0, 8);\n    guest_store(arg0, 9, 2); /* PROCESSOR_ARCHITECTURE_AMD64 = 9 */\n    guest_store(arg0 + 4, 4096, 4); /* PageSize = 4096 */\n    guest_store(arg0 + 8, 0x10000, 8); /* MinimumApplicationAddress */\n    guest_store(arg0 + 16, 0x7ffffffeffff, 8); /* MaximumApplicationAddress */\n    guest_store(arg0 + 24, 0xff, 8); /* ActiveProcessorMask = 8 cores */\n    guest_store(arg0 + 32, 8, 4); /* NumberOfProcessors = 8 */\n    guest_store(arg0 + 36, 8664, 4); /* ProcessorType = PROCESSOR_AMD64_X8664 */\n    guest_store(arg0 + 40, 65536, 4); /* AllocationGranularity = 64KB */\n}\nreturn 0;"
+    },
+    {
+      "name": "GetNativeSystemInfo",
+      "params": [
+        "u64 sysinfo_ptr"
+      ],
+      "ret": "void",
+      "code": "guest_GetSystemInfo(arg0, 0, 0, 0); return 0;"
+    },
+    {
+      "name": "CloseHandle",
+      "params": [
+        "u64 handle"
+      ],
+      "ret": "u32",
+      "code": "return guest_close_handle(arg0);"
+    },
+    {
+      "name": "CreateFileW",
+      "ret": "u64",
+      "code": "return subsys_CreateFileW(arg0, (uint32_t)arg1, (uint32_t)arg2, arg3, 3, 0, 0);"
+    },
+    {
+      "name": "CreateFileA",
+      "ret": "u64",
+      "code": "return subsys_CreateFileA(arg0, (uint32_t)arg1, (uint32_t)arg2, arg3, 3, 0, 0);"
+    },
+    {
+      "name": "ReadFile",
+      "ret": "u32",
+      "code": "return subsys_ReadFile(arg0, arg1, (uint32_t)arg2, arg3, 0);"
+    },
+    {
+      "name": "SetFilePointer",
+      "ret": "u32",
+      "code": "return subsys_SetFilePointer(arg0, (int32_t)arg1, arg2, (uint32_t)arg3);"
+    },
+    {
+      "name": "SetFilePointerEx",
+      "ret": "u32",
+      "code": "return subsys_SetFilePointerEx(arg0, (int64_t)arg1, arg2, (uint32_t)arg3);"
+    },
+    {
+      "name": "GetFileSize",
+      "ret": "u32",
+      "code": "return subsys_GetFileSize(arg0, arg1);"
+    },
+    {
+      "name": "GetFileSizeEx",
+      "ret": "u32",
+      "code": "return subsys_GetFileSizeEx(arg0, arg1);"
+    },
+    {
+      "name": "FlushFileBuffers",
+      "ret": "u32",
+      "code": "return subsys_FlushFileBuffers(arg0);"
+    },
+    {
+      "name": "DuplicateHandle",
+      "ret": "u32",
+      "code": "return subsys_DuplicateHandle(arg0, arg1, arg2, arg3, 0, 0, 0);"
+    },
+    {
+      "name": "GetFileAttributesW",
+      "ret": "u32",
+      "code": "return subsys_GetFileAttributesW(arg0);"
+    },
+    {
+      "name": "GetFileAttributesA",
+      "ret": "u32",
+      "code": "return subsys_GetFileAttributesA(arg0);"
+    },
+    {
+      "name": "DeleteFileW",
+      "ret": "u32",
+      "code": "return subsys_DeleteFileW(arg0);"
+    },
+    {
+      "name": "DeleteFileA",
+      "ret": "u32",
+      "code": "return subsys_DeleteFileA(arg0);"
+    },
+    {
+      "name": "CreateDirectoryW",
+      "ret": "u32",
+      "code": "return subsys_CreateDirectoryW(arg0, arg1);"
+    },
+    {
+      "name": "CreateDirectoryA",
+      "ret": "u32",
+      "code": "return subsys_CreateDirectoryA(arg0, arg1);"
+    },
+    {
+      "name": "RemoveDirectoryW",
+      "ret": "u32",
+      "code": "return subsys_RemoveDirectoryW(arg0);"
+    },
+    {
+      "name": "RemoveDirectoryA",
+      "ret": "u32",
+      "code": "return subsys_RemoveDirectoryA(arg0);"
+    },
+    {
+      "name": "GetCurrentDirectoryW",
+      "ret": "u32",
+      "code": "return subsys_GetCurrentDirectoryW((uint32_t)arg0, arg1);"
+    },
+    {
+      "name": "GetCurrentDirectoryA",
+      "ret": "u32",
+      "code": "return subsys_GetCurrentDirectoryA((uint32_t)arg0, arg1);"
+    },
+    {
+      "name": "SetCurrentDirectoryW",
+      "ret": "u32",
+      "code": "return subsys_SetCurrentDirectoryW(arg0);"
+    },
+    {
+      "name": "SetCurrentDirectoryA",
+      "ret": "u32",
+      "code": "return subsys_SetCurrentDirectoryA(arg0);"
+    },
+    {
+      "name": "GetTempPathW",
+      "ret": "u32",
+      "code": "return subsys_GetTempPathW((uint32_t)arg0, arg1);"
+    },
+    {
+      "name": "GetTempPathA",
+      "ret": "u32",
+      "code": "return subsys_GetTempPathA((uint32_t)arg0, arg1);"
+    },
+    {
+      "name": "FindFirstFileW",
+      "ret": "u64",
+      "code": "return subsys_FindFirstFileW(arg0, arg1);"
+    },
+    {
+      "name": "FindNextFileW",
+      "ret": "u32",
+      "code": "return subsys_FindNextFileW(arg0, arg1);"
+    },
+    {
+      "name": "FindClose",
+      "ret": "u32",
+      "code": "return subsys_FindClose(arg0);"
+    },
+    {
+      "name": "VirtualAlloc",
+      "ret": "u64",
+      "code": "return subsys_VirtualAlloc(arg0, arg1, (uint32_t)arg2, (uint32_t)arg3);"
+    },
+    {
+      "name": "VirtualFree",
+      "ret": "u32",
+      "code": "return subsys_VirtualFree(arg0, arg1, (uint32_t)arg2);"
+    },
+    {
+      "name": "CreateFileMappingW",
+      "ret": "u64",
+      "code": "return subsys_CreateFileMappingW(arg0, arg1, (uint32_t)arg2, 0, 0, arg3);"
+    },
+    {
+      "name": "MapViewOfFile",
+      "ret": "u64",
+      "code": "return subsys_MapViewOfFile(arg0, (uint32_t)arg1, 0, (uint32_t)arg2, arg3);"
+    },
+    {
+      "name": "UnmapViewOfFile",
+      "ret": "u32",
+      "code": "return subsys_UnmapViewOfFile(arg0);"
+    },
+    {
+      "name": "CreateEventW",
+      "ret": "u64",
+      "code": "return subsys_CreateEventW(arg0, (uint32_t)arg1, (uint32_t)arg2, arg3);"
+    },
+    {
+      "name": "CreateEventA",
+      "ret": "u64",
+      "code": "return subsys_CreateEventA(arg0, (uint32_t)arg1, (uint32_t)arg2, arg3);"
+    },
+    {
+      "name": "SetEvent",
+      "ret": "u32",
+      "code": "return subsys_SetEvent(arg0);"
+    },
+    {
+      "name": "ResetEvent",
+      "ret": "u32",
+      "code": "return subsys_ResetEvent(arg0);"
+    },
+    {
+      "name": "WaitForSingleObject",
+      "ret": "u32",
+      "code": "return subsys_WaitForSingleObject(arg0, (uint32_t)arg1);"
+    },
+    {
+      "name": "WaitForMultipleObjects",
+      "ret": "u32",
+      "code": "return subsys_WaitForMultipleObjects((uint32_t)arg0, arg1, (uint32_t)arg2, (uint32_t)arg3);"
+    },
+    {
+      "name": "InitializeSRWLock",
+      "ret": "void",
+      "code": "subsys_InitializeSRWLock(arg0); return 0;"
+    },
+    {
+      "name": "AcquireSRWLockExclusive",
+      "ret": "void",
+      "code": "subsys_AcquireSRWLockExclusive(arg0); return 0;"
+    },
+    {
+      "name": "ReleaseSRWLockExclusive",
+      "ret": "void",
+      "code": "subsys_ReleaseSRWLockExclusive(arg0); return 0;"
+    },
+    {
+      "name": "AcquireSRWLockShared",
+      "ret": "void",
+      "code": "subsys_AcquireSRWLockShared(arg0); return 0;"
+    },
+    {
+      "name": "ReleaseSRWLockShared",
+      "ret": "void",
+      "code": "subsys_ReleaseSRWLockShared(arg0); return 0;"
+    },
+    {
+      "name": "SleepConditionVariableSRW",
+      "ret": "u32",
+      "code": "return subsys_SleepConditionVariableSRW(arg0, arg1, (uint32_t)arg2, (uint32_t)arg3);"
+    },
+    {
+      "name": "WakeConditionVariable",
+      "ret": "void",
+      "code": "subsys_WakeConditionVariable(arg0); return 0;"
+    },
+    {
+      "name": "WakeAllConditionVariable",
+      "ret": "void",
+      "code": "subsys_WakeAllConditionVariable(arg0); return 0;"
+    },
+    {
+      "name": "InitOnceExecuteOnce",
+      "ret": "u32",
+      "code": "return subsys_InitOnceExecuteOnce(arg0, arg1, arg2, arg3);"
+    }
+  ]
+}

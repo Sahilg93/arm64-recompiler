@@ -1,0 +1,15 @@
+LIBRARY kernel32.dll
+EXPORTS
+CloseHandle
+CreateThread
+ExitProcess
+FreeLibrary
+GetCurrentThreadId
+GetExitCodeThread
+GetProcAddress
+LoadLibraryW
+TlsAlloc
+TlsFree
+TlsGetValue
+TlsSetValue
+WaitForSingleObject

@@ -56,7 +56,24 @@ reject uninitialized-register '0xc3' 'undefined incoming eax'
 reject uninitialized-flags '0x74, 0x00, 0x89, 0xc8, 0xc3' 'undefined incoming zf'
 reject guest-memory '0x8b, 0x01, 0xc3' 'expected a supported 32-bit volatile register'
 
-for variant in console console-variant console-flow console-flow-O0 console-flow-loop console-data console-atomic; do
+# Build a fixture import library directly. The Windows GNU SDK is optional.
+cat > "$build/console-kernel32.def" <<'EOF'
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess
+GetCurrentProcessId
+GetCurrentThreadId
+GetLastError
+GetStdHandle
+GetSystemTimeAsFileTime
+QueryPerformanceCounter
+SetLastError
+WriteFile
+EOF
+"$python" -m ziglang dlltool -m i386:x86-64 -d "$build/console-kernel32.def" \
+    -l "$build/console-kernel32.lib"
+
+for variant in console console-variant console-flow console-flow-O0 console-flow-loop console-data console-atomic console-seto console-bits console-pcmpeq console-zcnt console-shufpd; do
     prefix="$build/$variant"
     source=console.c
     optimization=-O2
@@ -72,6 +89,21 @@ for variant in console console-variant console-flow console-flow-O0 console-flow
     elif [[ "$variant" == console-atomic ]]; then
         source=console_atomic.c
         message="atomic cmpxchg passed"
+    elif [[ "$variant" == console-seto ]]; then
+        source=console_seto.c
+        message="seto and setno passed"
+    elif [[ "$variant" == console-bits ]]; then
+        source=console_bits.c
+        message="bsr and bsf passed"
+    elif [[ "$variant" == console-pcmpeq ]]; then
+        source=console_pcmpeq.c
+        message="pcmpeq passed"
+    elif [[ "$variant" == console-zcnt ]]; then
+        source=console_zcnt.c
+        message="tzcnt and lzcnt passed"
+    elif [[ "$variant" == console-shufpd ]]; then
+        source=console_shufpd.c
+        message="shufpd passed"
     elif [[ "$variant" == console-flow* ]]; then
         source=console_flow.c
         if [[ "$variant" == console-flow-O0 ]]; then
@@ -87,7 +119,7 @@ for variant in console console-variant console-flow console-flow-O0 console-flow
     clang -target x86_64-pc-windows-msvc "$optimization" "-DMESSAGE=\"$message\"" \
         ${definitions[@]+"${definitions[@]}"} -c "$source" -o "$prefix.obj"
     "$python" -m ziglang cc -target x86_64-windows-gnu -nostdlib "$prefix.obj" \
-        -lkernel32 -Wl,--entry,entry -Wl,--strip-all -o "$prefix.exe"
+        "$build/console-kernel32.lib" -Wl,--entry,entry -Wl,--strip-all -o "$prefix.exe"
     "$python" console_lift.py "$prefix.exe" "$prefix.ll"
     clang -arch arm64 -O2 -Wall -Wextra -Werror -Wno-override-module \
         "$prefix.ll" console_runtime.c -o "$prefix"
@@ -105,3 +137,48 @@ status=0
 "$prefix-bad-return" > "$prefix-bad-return.stdout" 2>"$prefix-bad-return.stderr" || status=$?
 [[ "$status" == 125 ]]
 grep -Fx 'guest return address mismatch' "$prefix-bad-return.stderr"
+
+# Virtual memory: zero-tag VirtualAlloc/MapViewOfFile through guest_load/guest_store.
+clang -arch arm64 -O1 -w test_mmap.c -o "$build/test_mmap"
+"$build/test_mmap"
+
+# Optional Wine oracle: WINE/WINEPREFIX, else the copy setup_wine.py installs,
+# else the one under work/. Without Wine the fixtures still run on ARM64.
+repository="$(cd ../.. && pwd)"
+if [[ -z "${WINE:-}" ]]; then
+    for candidate in "$PWD/wine-runtime/Wine Stable.app/Contents/Resources/wine/bin/wine" \
+                     "$repository/work/wine/Wine Stable.app/Contents/Resources/wine/bin/wine"; do
+        if [[ -x "$candidate" ]]; then
+            export WINE="$candidate"
+            break
+        fi
+    done
+    if [[ -n "${WINE:-}" && -z "${WINEPREFIX:-}" && -d "$repository/work/wine/prefix" ]]; then
+        export WINEPREFIX="$repository/work/wine/prefix"
+    fi
+fi
+export WINEDEBUG="${WINEDEBUG:--all}" MVK_CONFIG_LOG_LEVEL="${MVK_CONFIG_LOG_LEVEL:-0}"
+export PYTHON="$python"
+
+# Darwin SIGSEGV/SIGBUS delivery for raw VirtualAlloc faults to VEH and table-driven SEH.
+fixtures/vm_fault/test.sh
+
+# MSVC C++ EH and __try/__except, compared with Wine. Needs clang-cl and an xwin SDK.
+if [[ -z "${XWIN_SDK:-}" && -d "$repository/work/xwin-sdk/crt" ]]; then
+    export XWIN_SDK="$repository/work/xwin-sdk"
+fi
+if [[ -z "${CLANG_CL:-}" ]] && ! command -v clang-cl > /dev/null; then
+    for candidate in /opt/homebrew/opt/llvm/bin/clang-cl /usr/local/opt/llvm/bin/clang-cl; do
+        [[ -x "$candidate" ]] && export CLANG_CL="$candidate" && break
+    done
+fi
+if [[ -n "${XWIN_SDK:-}" ]] && command -v "${CLANG_CL:-clang-cl}" > /dev/null &&
+   command -v "${LLD_LINK:-lld-link}" > /dev/null; then
+    fixtures/exception/test_msvc.sh
+    echo "PASS MSVC exception fixture${WINE:+ (matches Wine)}"
+elif [[ "${REQUIRE_MSVC:-0}" == 1 ]]; then
+    echo "MSVC exception fixture needs XWIN_SDK, clang-cl, and lld-link" >&2
+    exit 1
+else
+    echo "SKIP MSVC exception fixture (set XWIN_SDK and install LLVM clang-cl/lld-link)" >&2
+fi

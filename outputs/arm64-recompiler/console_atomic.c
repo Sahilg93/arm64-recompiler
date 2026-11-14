@@ -6,6 +6,7 @@ __declspec(dllimport) __attribute__((noreturn)) void ExitProcess(DWORD);
 
 static volatile unsigned long long mem64 = 0x1122334455667788ULL;
 static volatile unsigned int mem32 = 0x12345678U;
+static volatile unsigned char mem8 = 7;
 static char output[] = "atomic cmpxchg passed\n";
 
 void entry(void) {
@@ -102,6 +103,18 @@ void entry(void) {
     );
     if (!zf || r_dest32 != 400U || rax32 != 300ULL)
         ExitProcess(106);
+
+    unsigned long long byte_accumulator = 0x123456789abcde06ULL;
+    unsigned char byte_replacement = 91;
+    __asm__ volatile(
+        "lock cmpxchgb %3, %1\n\t"
+        "sete %0"
+        : "=q"(zf), "+m"(mem8), "+a"(byte_accumulator)
+        : "q"(byte_replacement)
+        : "cc"
+    );
+    if (zf || mem8 != 7 || byte_accumulator != 0x123456789abcde07ULL)
+        ExitProcess(109);
 
     DWORD written;
     int ok = WriteFile(GetStdHandle((DWORD)-11), output, sizeof(output) - 1, &written, 0);

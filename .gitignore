@@ -36,3 +36,7 @@ work/*
 !work/corpus/*.exe
 work/corpus/*.zip
 
+
+# Local caches (xwin downloads, lifter object cache)
+.xwin-cache/
+outputs/arm64-recompiler/.cache/

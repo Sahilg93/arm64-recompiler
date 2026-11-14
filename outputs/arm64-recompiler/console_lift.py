@@ -1,7 +1,10 @@
 """Lift a restricted Windows console entry subset to native LLVM IR."""
 
 import argparse
+import json
 from pathlib import Path
+import re
+import struct
 
 import capstone as cs
 from capstone import x86_const as x
@@ -9,11 +12,27 @@ import pefile
 
 from lift import Lift, read_image_entry
 
+try:
+    from generated_shims import GENERATED_SHIMS, FLOAT_1ARG_SHIMS, FLOAT_2ARG_SHIMS
+except ImportError:
+    GENERATED_SHIMS = []
+    FLOAT_1ARG_SHIMS = []
+    FLOAT_2ARG_SHIMS = []
+
+WINE_DB = {}
+wine_db_path = Path(__file__).parent / "wine_api_db.json"
+if wine_db_path.exists():
+    try:
+        with open(wine_db_path) as f:
+            WINE_DB = json.load(f).get("api_to_dll", {})
+    except Exception:
+        pass
+
 MAX_BLOCKS = 60000
 
-FLS_IMPORTS = {"FlsAlloc": 0x7fff1002, "FlsGetValue": 0x7fff1003, "FlsGetValue2": 0x7fff1003, "FlsSetValue": 0x7fff1004, "FlsFree": 0x7fff1005}
+FLS_IMPORTS = {"FlsAlloc": 0x7fff1002, "FlsGetValue": 0x7fff1003, "FlsGetValue2": 0x7fff1003, "FlsSetValue": 0x7fff1004, "FlsFree": 0x7fff1005, "TlsAlloc": 0x7fff1031, "TlsGetValue": 0x7fff1003, "TlsSetValue": 0x7fff1004, "TlsFree": 0x7fff1005}
 IDENTITY_IMPORTS = {"GetCurrentProcessId": 0, "GetCurrentThreadId": 1}
-IMPORTS = {"GetStdHandle", "WriteFile", "ExitProcess", "SetLastError", "GetLastError", "GetSystemTimeAsFileTime", "QueryPerformanceCounter", "LoadLibraryExW", "GetProcAddress", "FreeLibrary", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc", "EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "InitializeCriticalSection", "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx", "VirtualProtect", "GetStartupInfoW", "GetFileType", "GetCommandLineA", "GetCommandLineW", "GetACP", "GetOEMCP", "IsValidCodePage", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetModuleHandleExW", "WideCharToMultiByte", "MultiByteToWideChar", "InitializeSListHead", "GetEnvironmentStringsW", "FreeEnvironmentStringsW", "SetUnhandledExceptionFilter", "GetSystemDirectoryA", "GetSystemDirectoryW", "LoadLibraryA", "__acrt_iob_func", "fwrite", "fputs", "fflush", "_errno", "fputc", "putchar", "puts", "setvbuf", "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler", "MessageBoxA", "MessageBoxW", "_crt_atexit", "_register_onexit_function", "_initialize_onexit_table", "_execute_onexit_table", "_initterm", "_initterm_e", "_configure_wide_argv", "_configure_narrow_argv", "_initialize_wide_environment", "_initialize_narrow_environment", "_get_initial_wide_environment", "_get_initial_narrow_environment", "_set_app_type", "_seh_filter_exe", "_set_invalid_parameter_handler", "__p___argc", "__p___wargv", "__p___argv", "exit", "_exit", "_cexit", "SetThreadStackGuarantee", "malloc", "free", "calloc", "realloc", "GetCurrentThread", "GetCurrentProcess", "__p__fmode", "__p__commode"} | IDENTITY_IMPORTS.keys() | FLS_IMPORTS.keys()
+IMPORTS = {"GetStdHandle", "WriteFile", "NtReadFile", "ExitProcess", "SetLastError", "GetLastError", "GetSystemTimeAsFileTime", "QueryPerformanceCounter", "LoadLibraryW", "LoadLibraryExW", "GetProcAddress", "FreeLibrary", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc", "EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "InitializeCriticalSection", "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx", "VirtualProtect", "GetStartupInfoW", "GetFileType", "GetCommandLineA", "GetCommandLineW", "GetACP", "GetOEMCP", "IsValidCodePage", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetModuleHandleExW", "WideCharToMultiByte", "MultiByteToWideChar", "InitializeSListHead", "GetEnvironmentStringsW", "FreeEnvironmentStringsW", "SetUnhandledExceptionFilter", "GetSystemDirectoryA", "GetSystemDirectoryW", "LoadLibraryA", "__acrt_iob_func", "fwrite", "fputs", "fflush", "_errno", "fputc", "putchar", "puts", "setvbuf", "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler", "MessageBoxA", "MessageBoxW", "_crt_atexit", "_register_onexit_function", "_initialize_onexit_table", "_execute_onexit_table", "_initterm", "_initterm_e", "_configure_wide_argv", "_configure_narrow_argv", "_initialize_wide_environment", "_initialize_narrow_environment", "_get_initial_wide_environment", "_get_initial_narrow_environment", "_set_app_type", "_seh_filter_exe", "_set_invalid_parameter_handler", "__p___argc", "__p___wargv", "__p___argv", "exit", "_exit", "_cexit", "SetThreadStackGuarantee", "malloc", "free", "calloc", "realloc", "GetCurrentThread", "GetCurrentProcess", "__p__fmode", "__p__commode", "__p__wenviron", "__p__environ", "getenv", "_set_new_mode", "wcslen", "wcsnlen", "strlen", "strnlen", "memset", "memcpy", "memmove", "strcmp", "strncmp", "strcpy", "_strdup", "isalnum", "isalpha", "isspace", "ProcessPrng", "GetHandleInformation", "GetTickCount64", "GetTickCount", "GetSystemTimePreciseAsFileTime", "QueryPerformanceFrequency", "IsProcessorFeaturePresent", "UnhandledExceptionFilter", "TerminateProcess", "RtlCaptureContext", "RaiseException", "RtlLookupFunctionEntry", "RtlUnwindEx", "RtlVirtualUnwind", "IsDebuggerPresent", "CreateThread", "GetFinalPathNameByHandleW", "WaitOnAddress", "WakeByAddressSingle", "WakeByAddressAll", "CreateWaitableTimerExW", "CreateWaitableTimerW", "SetWaitableTimer"} | IDENTITY_IMPORTS.keys() | FLS_IMPORTS.keys() | set(GENERATED_SHIMS)
 VOLATILE = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
 NONVOLATILE = ("rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15")
 ALIASES = {
@@ -44,12 +63,22 @@ def imported_calls(image):
 
 
 class ConsoleLift(Lift):
-    def __init__(self, image, *, trace=False, callback_targets=None):
+    def __init__(self, image, *, trace=False, callback_targets=None, stub_unknown=True, modules=False, fault_delivery=False):
         super().__init__()
         self.trace = trace
+        self.fault_delivery = fault_delivery
+        self.resume_sites = set()
+        self.stub_unknown = stub_unknown
+        self.strings = {}
         self.shared = False
+        self.module_base = 0
+        self.modules = modules
         self.image = image
         self.image_exception_entries = getattr(image, "DIRECTORY_ENTRY_EXCEPTION", ())
+        self.runtime_functions = {
+            row.struct.BeginAddress: row.struct.EndAddress
+            for row in self.image_exception_entries
+        }
         self.traps = {}
         self.imports = imported_calls(image)
         self.iat_labels = {item.address - image.OPTIONAL_HEADER.ImageBase:
@@ -65,17 +94,47 @@ class ConsoleLift(Lift):
                           "GuardXFGTableDispatchFunctionPointer")
             if config and (pointer := getattr(config.struct, field, 0))
         }
-        self.callback_targets = callback_targets or {}
+        self.foreign_iat = {
+            item.address - self.image_base
+            for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ())
+            if dll.dll.lower() != b"kernel32.dll"
+            for item in dll.imports
+        }
+        self.iat_thunks = {}
+        self.foreign_thunks = {}
+        for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ()):
+            for item in dll.imports:
+                if item.name:
+                    rva = item.address - self.image_base
+                    raw_val = image.get_qword_at_rva(rva)
+                    if raw_val and raw_val < image.OPTIONAL_HEADER.SizeOfImage:
+                        self.iat_thunks[raw_val] = item.name.decode("ascii", "replace")
+                        if rva in self.foreign_iat:
+                            self.foreign_thunks[raw_val] = rva
+        if callback_targets is None:
+            self.callback_targets = find_switch_tables(image)
+        else:
+            self.callback_targets = callback_targets
         tls = getattr(image, "DIRECTORY_ENTRY_TLS", None)
         self.tls_callbacks = []
-        if tls and tls.struct.AddressOfCallBacks:
-            cb_rva = tls.struct.AddressOfCallBacks - self.image_base
-            for idx in range(256):
-                va = image.get_qword_at_rva(cb_rva + idx * 8)
-                if va is None or va == 0:
-                    break
-                rva = va - self.image_base if va >= self.image_base else va
-                self.tls_callbacks.append(rva)
+        if tls and tls.struct:
+            self.tls_start = getattr(tls.struct, "StartAddressOfRawData", 0)
+            self.tls_end = getattr(tls.struct, "EndAddressOfRawData", 0)
+            self.tls_index_va = getattr(tls.struct, "AddressOfIndex", 0)
+            self.tls_zero_fill = getattr(tls.struct, "SizeOfZeroFill", 0)
+            if tls.struct.AddressOfCallBacks:
+                cb_rva = tls.struct.AddressOfCallBacks - self.image_base
+                for idx in range(256):
+                    va = image.get_qword_at_rva(cb_rva + idx * 8)
+                    if va is None or va == 0:
+                        break
+                    rva = va - self.image_base if va >= self.image_base else va
+                    self.tls_callbacks.append(rva)
+        else:
+            self.tls_start = 0
+            self.tls_end = 0
+            self.tls_index_va = 0
+            self.tls_zero_fill = 0
         self.defined = dict.fromkeys(("rsp", *NONVOLATILE), 64)
         self.zero = False
         self.carry = False
@@ -85,6 +144,14 @@ class ConsoleLift(Lift):
         self.pending = []
         self.decoded = {}
         self.occupied = {}
+
+    def string_constant(self, text: str) -> str:
+        if text not in self.strings:
+            var_name = f".str_{len(self.strings)}_{''.join(c if c.isalnum() else '_' for c in text[:16])}"
+            encoded = text.encode("utf-8") + b"\0"
+            escaped = "".join(f"\\{b:02x}" if b < 32 or b >= 127 or b in (b'"'[0], b'\\'[0]) else chr(b) for b in encoded)
+            self.strings[text] = (var_name, len(encoded), escaped)
+        return self.strings[text][0]
 
     def reg(self, ins, operand):
         name = ins.reg_name(operand.reg)
@@ -124,7 +191,7 @@ class ConsoleLift(Lift):
         if mem.segment not in (0, x.X86_REG_GS) or (ins.addr_size not in (4, 8) and ins.mnemonic != "lea"):
             raise ValueError("unsupported segmented or narrow address")
         if mem.base == x.X86_REG_RIP:
-            return str(ins.address + ins.size + mem.disp)
+            return str(ins.address + ins.size + mem.disp + self.module_base)
         address = str(mem.disp + (0x2101000 if mem.segment else 0))
         for register, scale in ((mem.base, 1), (mem.index, mem.scale)):
             if register:
@@ -175,6 +242,16 @@ class ConsoleLift(Lift):
     def write(self, ins, operand, value):
         width = operand.size * 8
         if operand.type == x.X86_OP_REG:
+            name = ins.reg_name(operand.reg)
+            if name in {"ah", "bh", "ch", "dh"} and width == 8:
+                reg_name = f"r{name[0]}x"
+                wide_val = self.value(f"zext i8 {value} to i64")
+                shifted = self.value(f"shl i64 {wide_val}, 8")
+                old = self.load("i64", reg_name)
+                cleared = self.value(f"and i64 {old}, -65281")
+                new_val = self.value(f"or i64 {cleared}, {shifted}")
+                self.store("i64", new_val, reg_name)
+                return
             self.write_reg(*self.reg(ins, operand), value)
         elif operand.type == x.X86_OP_MEM:
             addr = self.address(ins, operand)
@@ -192,23 +269,62 @@ class ConsoleLift(Lift):
         operand = ins.operands[0]
         if operand.type != x.X86_OP_MEM or operand.mem.base != x.X86_REG_RIP:
             raise ValueError("expected a RIP-relative IAT call")
-        slot = int(self.address(ins, operand))
+        slot = int(self.address(ins, operand)) - self.module_base
         name = self.imports.get(slot)
         if name not in IMPORTS:
-            label = self.iat_labels.get(slot)
-            if label:
-                self.trap(f"RVA {ins.address:#x}: unsupported import {label}")
+            raw_val = self.image.get_qword_at_rva(slot) if slot < self.image.OPTIONAL_HEADER.SizeOfImage else 0
+            call_target = raw_val if (raw_val and raw_val < self.image.OPTIONAL_HEADER.SizeOfImage) else slot
+            if name in {"RegOpenKeyExW", "RegQueryValueExW"}:
+                self.guarded_call(ins, str(call_target + self.module_base), ins.address + ins.size, (), tail=tail)
                 return True
-            raise ValueError(f"call through non-IAT slot RVA {slot:#x}")
-        if name == "ExitProcess":
+            self.dynamic_call(str(call_target + self.module_base))
+            return False
+        elif name == "ExitProcess":
             status = self.read_reg("rcx", 32)
             self.line(f"  call void @guest_exit(i32 {status})")
             self.line("  unreachable")
             return True
-        if name in FLS_IMPORTS:
+        elif name in FLS_IMPORTS:
             self.dynamic_call(str(FLS_IMPORTS[name]))
             return False
-        if name == "LoadLibraryA":
+        elif name == "CreateThread":
+            attrs, size, start, argument = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9"))
+            rsp = self.read_reg("rsp", 64)
+            flags_ptr = self.value(f"add i64 {rsp}, {40 if tail else 32}")
+            id_ptr = self.value(f"add i64 {rsp}, {48 if tail else 40}")
+            flags = self.value(f"call i64 @guest_load(i64 {flags_ptr}, i32 4)")
+            flags = self.value(f"trunc i64 {flags} to i32")
+            thread_id = self.value(f"call i64 @guest_load(i64 {id_ptr}, i32 8)")
+            result = self.value(f"call i64 @guest_create_thread(i64 {attrs}, i64 {size}, i64 {start}, i64 {argument}, i32 {flags}, i64 {thread_id})")
+        elif name == "GetFinalPathNameByHandleW":
+            handle, buf, cch, flags = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9"))
+            cch_32 = self.value(f"trunc i64 {cch} to i32")
+            flags_32 = self.value(f"trunc i64 {flags} to i32")
+            result = self.value(f"call i64 @guest_GetFinalPathNameByHandleW(i64 {handle}, i64 {buf}, i32 {cch_32}, i32 {flags_32})")
+        elif name == "WaitOnAddress":
+            addr, cmp_addr, size, ms = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9"))
+            ms_32 = self.value(f"trunc i64 {ms} to i32")
+            result = self.value(f"call i64 @guest_WaitOnAddress(i64 {addr}, i64 {cmp_addr}, i64 {size}, i32 {ms_32})")
+        elif name == "WakeByAddressSingle":
+            addr = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_WakeByAddressSingle(i64 {addr})")
+        elif name == "WakeByAddressAll":
+            addr = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_WakeByAddressAll(i64 {addr})")
+        elif name == "CreateWaitableTimerExW":
+            attrs, name_ptr, flags, access = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9"))
+            flags_32 = self.value(f"trunc i64 {flags} to i32")
+            access_32 = self.value(f"trunc i64 {access} to i32")
+            result = self.value(f"call i64 @guest_CreateWaitableTimerExW(i64 {attrs}, i64 {name_ptr}, i32 {flags_32}, i32 {access_32})")
+        elif name == "CreateWaitableTimerW":
+            attrs, name_ptr, manual = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8"))
+            manual_32 = self.value(f"trunc i64 {manual} to i32")
+            result = self.value(f"call i64 @guest_CreateWaitableTimerW(i64 {attrs}, i64 {name_ptr}, i32 {manual_32})")
+        elif name == "SetWaitableTimer":
+            timer, due_time, period, routine = (self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9"))
+            period_32 = self.value(f"trunc i64 {period} to i32")
+            result = self.value(f"call i64 @guest_SetWaitableTimer(i64 {timer}, i64 {due_time}, i32 {period_32}, i64 {routine})")
+        elif name == "LoadLibraryA":
             path = self.read_reg("rcx", 64)
             result = self.value(f"call i64 @guest_load_library_a(i64 {path})")
         elif name in {"GetSystemDirectoryA", "GetSystemDirectoryW"}:
@@ -321,6 +437,69 @@ class ConsoleLift(Lift):
             result = self.value("call i64 @guest_p_wargv()")
         elif name == "__p___argv":
             result = self.value("call i64 @guest_p_argv()")
+        elif name == "__p__wenviron":
+            result = self.value("call i64 @guest_p_wenviron()")
+        elif name == "__p__environ":
+            result = self.value("call i64 @guest_p_environ()")
+        elif name == "getenv":
+            s = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_getenv(i64 {s})")
+        elif name == "_set_new_mode":
+            mode = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_set_new_mode(i32 {mode})")
+        elif name == "wcslen":
+            s = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_wcslen(i64 {s})")
+        elif name == "wcsnlen":
+            s = self.read_reg("rcx", 64)
+            n = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_wcsnlen(i64 {s}, i64 {n})")
+        elif name == "strlen":
+            s = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_strlen(i64 {s})")
+        elif name == "strnlen":
+            s = self.read_reg("rcx", 64)
+            n = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_strnlen(i64 {s}, i64 {n})")
+        elif name == "memset":
+            d = self.read_reg("rcx", 64)
+            c = self.read_reg("rdx", 32)
+            n = self.read_reg("r8", 64)
+            result = self.value(f"call i64 @guest_memset(i64 {d}, i32 {c}, i64 {n})")
+        elif name in {"memcpy", "memmove"}:
+            d = self.read_reg("rcx", 64)
+            s = self.read_reg("rdx", 64)
+            n = self.read_reg("r8", 64)
+            result = self.value(f"call i64 @guest_memcpy(i64 {d}, i64 {s}, i64 {n})")
+        elif name == "strcmp":
+            s1 = self.read_reg("rcx", 64)
+            s2 = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_strcmp(i64 {s1}, i64 {s2})")
+        elif name == "strncmp":
+            s1 = self.read_reg("rcx", 64)
+            s2 = self.read_reg("rdx", 64)
+            n = self.read_reg("r8", 64)
+            result = self.value(f"call i64 @guest_strncmp(i64 {s1}, i64 {s2}, i64 {n})")
+        elif name == "strcpy":
+            d = self.read_reg("rcx", 64)
+            s = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_strcpy(i64 {d}, i64 {s})")
+        elif name == "_strdup":
+            s = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_strdup(i64 {s})")
+        elif name == "isalnum":
+            c = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_isalnum(i32 {c})")
+        elif name == "isalpha":
+            c = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_isalpha(i32 {c})")
+        elif name == "isspace":
+            c = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_isspace(i32 {c})")
+        elif name == "ProcessPrng":
+            buf = self.read_reg("rcx", 64)
+            sz = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_process_prng(i64 {buf}, i64 {sz})")
         elif name in {"exit", "_exit"}:
             status = self.read_reg("rcx", 32)
             self.line(f"  call void @guest_exit(i32 {status})")
@@ -426,18 +605,18 @@ class ConsoleLift(Lift):
             result = self.value(f"call i64 @{function}(i64 {handle}, i32 {flags}, i64 {argument})")
         elif name == "GetProcessHeap":
             result = str(0x7fff2001)
-        elif name in {"LoadLibraryExW", "GetProcAddress", "FreeLibrary"}:
+        elif name in {"LoadLibraryW", "LoadLibraryExW", "GetProcAddress", "FreeLibrary"}:
             first = self.read_reg("rcx", 64)
-            if name == "LoadLibraryExW":
-                reserved = self.read_reg("rdx", 64)
-                flags = self.read_reg("r8", 32)
+            if name in {"LoadLibraryW", "LoadLibraryExW"}:
+                reserved = self.read_reg("rdx", 64) if name == "LoadLibraryExW" else "0"
+                flags = self.read_reg("r8", 32) if name == "LoadLibraryExW" else "0"
                 result = self.value(f"call i64 @guest_load_library(i64 {first}, i64 {reserved}, i32 {flags})")
             elif name == "GetProcAddress":
                 symbol = self.read_reg("rdx", 64)
                 result = self.value(f"call i64 @guest_get_proc(i64 {first}, i64 {symbol})")
             else:
                 result = self.value(f"call i64 @guest_free_library(i64 {first})")
-        elif name == "GetSystemTimeAsFileTime":
+        elif name in {"GetSystemTimeAsFileTime", "GetSystemTimePreciseAsFileTime"}:
             address = self.read_reg("rcx", 64)
             self.line(f"  call void @guest_system_filetime(i64 {address})")
             result = None
@@ -459,7 +638,119 @@ class ConsoleLift(Lift):
         elif name == "GetStdHandle":
             selector = self.read_reg("rcx", 32)
             result = self.value(f"call i64 @guest_stdout(i32 {selector})")
-        else:
+        elif name == "GetHandleInformation":
+            handle = self.read_reg("rcx", 64)
+            flags = self.read_reg("rdx", 64)
+            result = self.value(f"call i64 @guest_get_handle_info(i64 {handle}, i64 {flags})")
+        elif name == "GetTickCount64":
+            result = self.value("call i64 @guest_tick_count_64()")
+        elif name == "GetTickCount":
+            result = self.value("call i64 @guest_tick_count()")
+        elif name == "QueryPerformanceFrequency":
+            address = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_performance_frequency(i64 {address})")
+        elif name == "IsProcessorFeaturePresent":
+            feature = self.read_reg("rcx", 32)
+            result = self.value(f"call i64 @guest_is_processor_feature_present(i32 {feature})")
+        elif name == "UnhandledExceptionFilter":
+            info = self.read_reg("rcx", 64)
+            result = self.value(f"call i64 @guest_unhandled_exception_filter(i64 {info})")
+        elif name == "TerminateProcess":
+            h = self.read_reg("rcx", 64)
+            code = self.read_reg("rdx", 32)
+            result = self.value(f"call i64 @guest_terminate_process(i64 {h}, i32 {code})")
+        elif name == "RaiseException":
+            code, flags, count = (self.read_reg(reg, 32) for reg in ("rcx", "rdx", "r8"))
+            arguments = self.read_reg("r9", 64)
+            rsp = self.read_reg("rsp", 64)
+            if tail:
+                pc = self.value(f"call i64 @guest_load(i64 {rsp}, i32 8)")
+                rsp = self.value(f"add i64 {rsp}, 8")
+            else:
+                pc = self.image_base + ins.address + ins.size
+            self.line(f"  call void @guest_raise_exception(i32 {code}, i32 {flags}, i32 {count}, i64 {arguments}, i64 {pc}, i64 {rsp})")
+            result = None
+        elif name == "RtlCaptureContext":
+            ctx = self.read_reg("rcx", 64)
+            self.line(f"  call void @guest_rtl_capture_context(i64 {ctx})")
+            result = None
+        elif name == "RtlLookupFunctionEntry":
+            pc = self.read_reg("rcx", 64)
+            base = self.read_reg("rdx", 64)
+            hist = self.read_reg("r8", 64)
+            result = self.value(f"call i64 @guest_rtl_lookup_function_entry(i64 {pc}, i64 {base}, i64 {hist})")
+        elif name == "RtlUnwindEx":
+            arguments = [self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9")]
+            rsp = self.read_reg("rsp", 64)
+            for offset in (40, 48) if tail else (32, 40):
+                slot = self.value(f"add i64 {rsp}, {offset}")
+                arguments.append(self.value(f"call i64 @guest_load(i64 {slot}, i32 8)"))
+            pc = self.image_base + ins.address + ins.size
+            if tail:
+                pc = self.value(f"call i64 @guest_load(i64 {rsp}, i32 8)")
+                rsp = self.value(f"add i64 {rsp}, 8")
+            operands = ", ".join(f"i64 {value}" for value in (*arguments, pc, rsp))
+            self.line(f"  call void @guest_rtl_unwind_ex({operands})")
+            self.line("  unreachable")
+            return True
+        elif name == "RtlVirtualUnwind":
+            registers = [self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9")]
+            kind = self.value(f"trunc i64 {registers[0]} to i32")
+            rsp = self.read_reg("rsp", 64)
+            arguments = [f"i32 {kind}", *(f"i64 {value}" for value in registers[1:])]
+            for offset in range(40 if tail else 32, 72 if tail else 64, 8):
+                slot = self.value(f"add i64 {rsp}, {offset}")
+                value = self.value(f"call i64 @guest_load(i64 {slot}, i32 8)")
+                arguments.append(f"i64 {value}")
+            result = self.value(f"call i64 @guest_rtl_virtual_unwind({', '.join(arguments)})")
+        elif name == "IsDebuggerPresent":
+            result = self.value("add i64 0, 0")
+        elif name in {"CreateFileMappingW", "MapViewOfFile"}:
+            registers = [self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9")]
+            rsp = self.read_reg("rsp", 64)
+            offset = 40 if tail else 32
+            slot = self.value(f"add i64 {rsp}, {offset}")
+            stack = self.value(f"call i64 @guest_load(i64 {slot}, i32 8)")
+            ints = (2, 3) if name == "CreateFileMappingW" else (1, 2, 3)
+            arguments = []
+            for index, value in enumerate(registers):
+                if index in ints:
+                    value = self.value(f"trunc i64 {value} to i32")
+                arguments.append(f"i{32 if index in ints else 64} {value}")
+            if name == "CreateFileMappingW":
+                size = self.value(f"trunc i64 {stack} to i32")
+                slot = self.value(f"add i64 {rsp}, {offset + 8}")
+                label = self.value(f"call i64 @guest_load(i64 {slot}, i32 8)")
+                arguments.extend((f"i32 {size}", f"i64 {label}"))
+            else:
+                arguments.append(f"i64 {stack}")
+            result = self.value(f"call i64 @subsys_{name}({', '.join(arguments)})")
+        elif name in FLOAT_1ARG_SHIMS:
+            arg0 = self.load("i64", "xmm0_0")
+            res_bits = self.value(f"call i64 @guest_{name}(i64 {arg0}, i64 0, i64 0, i64 0)")
+            self.store("i64", res_bits, "xmm0_0")
+            self.store("i64", "0", "xmm0_1")
+            result = None
+        elif name in FLOAT_2ARG_SHIMS:
+            arg0 = self.load("i64", "xmm0_0")
+            arg1 = self.load("i64", "xmm1_0")
+            res_bits = self.value(f"call i64 @guest_{name}(i64 {arg0}, i64 {arg1}, i64 0, i64 0)")
+            self.store("i64", res_bits, "xmm0_0")
+            self.store("i64", "0", "xmm0_1")
+            result = None
+        elif name in GENERATED_SHIMS:
+            arg0 = self.read_reg("rcx", 64)
+            arg1 = self.read_reg("rdx", 64)
+            arg2 = self.read_reg("r8", 64)
+            arg3 = self.read_reg("r9", 64)
+            result = self.value(f"call i64 @guest_{name}(i64 {arg0}, i64 {arg1}, i64 {arg2}, i64 {arg3})")
+        elif name == "NtReadFile":
+            rsp = self.read_reg("rsp", 64)
+            stack_args = self.value(f"add i64 {rsp}, {40 if tail else 32}")
+            registers = [self.read_reg(reg, 64) for reg in ("rcx", "rdx", "r8", "r9")]
+            args = ", ".join(f"i64 {value}" for value in (*registers, stack_args))
+            result = self.value(f"call i64 @guest_nt_read_file({args})")
+        elif name == "WriteFile":
             handle = self.read_reg("rcx", 64)
             buffer = self.read_reg("rdx", 64)
             size = self.read_reg("r8", 32)
@@ -469,11 +760,20 @@ class ConsoleLift(Lift):
             overlapped = self.value(f"call i64 @guest_load(i64 {slot}, i32 8)")
             result = self.value(f"call i64 @guest_write(i64 {handle}, i64 {buffer}, "
                                 f"i32 {size}, i64 {written}, i64 {overlapped})")
+        else:
+            raise ValueError(f"unhandled import call: {name}")
+        is_float_ret = name in FLOAT_1ARG_SHIMS or name in FLOAT_2ARG_SHIMS
         for register in (*VOLATILE, *(f"xmm{i}" for i in range(6))):
+            if is_float_ret and register == "xmm0":
+                continue
             self.defined.pop(register, None)
             if self.shared:
                 slot = f"{register}_0" if register.startswith("xmm") else register
                 self.line(f"  store i8 0, ptr %{slot}_width")
+        if is_float_ret:
+            self.defined["xmm0"] = 128
+            if self.shared:
+                self.line("  store i8 128, ptr %xmm0_0_width")
         self.zero = False
         self.carry = False
         self.signed = False
@@ -493,6 +793,14 @@ class ConsoleLift(Lift):
         return "%" + self.blocks[state]
 
     def jump(self, address, returns):
+        bound = self.runtime_functions.get(self.current) if self.shared else None
+        if bound and not (self.current <= address < bound):
+            if address in self.functions:
+                self.line(f"  musttail call void @{self.function(address)}(ptr %cpu, i64 %return_va)")
+                self.line("  ret void")
+            else:
+                self.return_to_caller(returns)
+            return
         self.line(f"  br label {self.block(address, returns)}")
 
     def dynamic_call(self, target):
@@ -526,23 +834,91 @@ class ConsoleLift(Lift):
         self.zero = self.carry = self.signed = self.overflow = False
         self.jump(following, returns)
 
+    def bounded_switch_targets(self, jump):
+        """Recognize a bounded, table-relative switch from decoded predecessors."""
+        if jump.operands[0].type != x.X86_OP_REG:
+            return ()
+        preceding = []
+        address = jump.address
+        for _ in range(12):
+            start = self.occupied.get(address - 1)
+            instruction = self.decoded.get(start)
+            if instruction is None or instruction.address + instruction.size != address:
+                break
+            preceding.insert(0, instruction)
+            address = start
+        if len(preceding) < 3:
+            return ()
+        lea, load, add = preceding[-3:]
+        if [ins.mnemonic for ins in (lea, load, add)] != ["lea", "movsxd", "add"]:
+            return ()
+        l, read, a = (ins.operands for ins in (lea, load, add))
+        if ([op.type for op in l] != [x.X86_OP_REG, x.X86_OP_MEM]
+                or [op.type for op in read] != [x.X86_OP_REG, x.X86_OP_MEM]
+                or [op.type for op in a] != [x.X86_OP_REG, x.X86_OP_REG]):
+            return ()
+        target = jump.operands[0].reg
+        memory = read[1].mem
+        if (read[0].reg != target or a[0].reg != target or a[1].reg != l[0].reg
+                or l[1].mem.base != x.X86_REG_RIP or memory.segment
+                or memory.base != l[0].reg or memory.scale != 4 or memory.disp
+                or not memory.index):
+            return ()
+
+        count = None
+        for guard in reversed(preceding[:-3]):
+            if guard.mnemonic == "and" and len(guard.operands) == 2 and guard.operands[0].type == x.X86_OP_REG and guard.operands[1].type == x.X86_OP_IMM:
+                count = guard.operands[1].imm + 1
+                break
+            elif guard.mnemonic == "cmp" and len(guard.operands) == 2 and guard.operands[0].type == x.X86_OP_REG and guard.operands[1].type == x.X86_OP_IMM:
+                count = guard.operands[1].imm + 1
+                break
+
+        table = lea.address + lea.size + l[1].mem.disp
+        section = self.image.get_section_by_rva(jump.address)
+        bound = self.runtime_functions.get(self.current) if self.shared else None
+        if count is None and not bound:
+            return ()
+        targets = set()
+        limit = count if (count is not None and 1 <= count <= 4096) else 256
+        for i in range(limit):
+            data = self.image.get_data(table + i * 4, 4)
+            if not data or len(data) < 4:
+                break
+            (offset,) = struct.unpack("<i", data)
+            dest = table + offset
+            if bound and not (self.current <= dest < bound):
+                if count is not None:
+                    return ()
+                break
+            if section and not section.contains_rva(dest):
+                if count is not None:
+                    return ()
+                break
+            targets.add(dest)
+        return targets
+
     def guarded_call(self, ins, target, following, returns, *, tail=False):
-        candidates = sorted(self.callback_targets.get(ins.address, ()))
+        local_targets = () if ins.address in self.callback_targets else (self.bounded_switch_targets(ins) if tail else ())
+        candidates = sorted(set(self.callback_targets.get(ins.address, ())) | set(local_targets))
         if candidates:
             self.counter += 1
             identifier = self.counter
             fallback = f"fallback{identifier}"
             self.line(f"  switch i64 {target}, label %{fallback} [")
             for address in candidates:
-                self.line(f"    i64 {address}, label %callback{identifier}_{address:x}")
+                self.line(f"    i64 {address + self.module_base}, label %callback{identifier}_{address:x}")
             self.line("  ]")
             initial = self.defined.copy()
             flags = self.zero, self.carry, self.signed, self.overflow
+            bound = self.runtime_functions.get(self.current) if self.shared else None
             for address in candidates:
                 self.line(f"callback{identifier}_{address:x}:")
                 self.defined = initial.copy()
                 self.zero, self.carry, self.signed, self.overflow = flags
-                if tail:
+                if tail and (address in local_targets or (bound and self.current <= address < bound)):
+                    self.jump(address, returns)
+                elif tail:
                     self.line(f"  musttail call void @{self.function(address)}(ptr %cpu, i64 %return_va)")
                     self.line("  ret void")
                 else:
@@ -587,10 +963,12 @@ class ConsoleLift(Lift):
             count, register, relative = 9, "r11", False
         else:
             code = self.image.get_data(ins.address - 11, 14)
-            guard = self.image.get_data(ins.address - 33, 10)
+            guard = bytes.fromhex("4983f80f0f87")
+            guarded = any(self.image.get_data(ins.address - offset, len(guard)) == guard
+                          for offset in (27, 33))
             if (code.startswith(bytes.fromhex("478b8c82"))
                     and code[-6:] == bytes.fromhex("4d03ca41ffe1")
-                    and guard.startswith(bytes.fromhex("4983f80f0f87"))):
+                    and guarded):
                 table = int.from_bytes(code[4:8], "little")
                 count, register, relative = 16, "r9", False
             else:
@@ -633,17 +1011,124 @@ class ConsoleLift(Lift):
 
     def step(self, ins, returns):
         op = ins.mnemonic
-        if op in {"lock inc", "lock dec", "lock or", "lock and", "lock cmpxchg"}:
-            op = op.removeprefix("lock ")
         args = ins.operands
         following = ins.address + ins.size
+        if op.startswith("lock ") and op in {"lock inc", "lock dec", "lock add", "lock sub", "lock or", "lock and", "lock bts"} and args and args[0].type == x.X86_OP_MEM:
+            width = args[0].size * 8
+            addr = self.address(ins, args[0])
+            ptr = self.value(f"call ptr @guest_pointer(i64 {addr}, i32 {width // 8})")
+            if op == "lock inc":
+                old = self.value(f"atomicrmw add ptr {ptr}, i{width} 1 seq_cst")
+                val = self.value(f"add i{width} {old}, 1")
+                zero = self.value(f"icmp eq i{width} {val}, 0")
+                negative = self.value(f"icmp slt i{width} {val}, 0")
+                boundary = (1 << (width - 1)) - 1
+                overflow = self.value(f"icmp eq i{width} {old}, {boundary}")
+                signed_less = self.value(f"xor i1 {negative}, {overflow}")
+                self.store("i1", zero, "zf")
+                self.store("i1", negative, "sf")
+                self.store("i1", overflow, "of")
+                self.store("i1", signed_less, "signed_less")
+                self.zero = self.signed = self.overflow = True
+            elif op == "lock dec":
+                old = self.value(f"atomicrmw sub ptr {ptr}, i{width} 1 seq_cst")
+                val = self.value(f"sub i{width} {old}, 1")
+                zero = self.value(f"icmp eq i{width} {val}, 0")
+                negative = self.value(f"icmp slt i{width} {val}, 0")
+                boundary = 1 << (width - 1)
+                overflow = self.value(f"icmp eq i{width} {old}, {boundary}")
+                signed_less = self.value(f"xor i1 {negative}, {overflow}")
+                self.store("i1", zero, "zf")
+                self.store("i1", negative, "sf")
+                self.store("i1", overflow, "of")
+                self.store("i1", signed_less, "signed_less")
+                self.zero = self.signed = self.overflow = True
+            elif op == "lock add":
+                operand = self.read(ins, args[1], width)
+                old = self.value(f"atomicrmw add ptr {ptr}, i{width} {operand} seq_cst")
+                val = self.value(f"add i{width} {old}, {operand}")
+                zero = self.value(f"icmp eq i{width} {val}, 0")
+                negative = self.value(f"icmp slt i{width} {val}, 0")
+                left = self.value(f"xor i{width} {old}, {val}")
+                right = self.value(f"xor i{width} {operand}, {val}")
+                both = self.value(f"and i{width} {left}, {right}")
+                overflow = self.value(f"icmp slt i{width} {both}, 0")
+                signed_less = self.value(f"xor i1 {negative}, {overflow}")
+                self.store("i1", zero, "zf")
+                self.store("i1", negative, "sf")
+                self.store("i1", overflow, "of")
+                self.store("i1", signed_less, "signed_less")
+                self.zero = self.signed = self.overflow = True
+            elif op == "lock sub":
+                operand = self.read(ins, args[1], width)
+                old = self.value(f"atomicrmw sub ptr {ptr}, i{width} {operand} seq_cst")
+                val = self.value(f"sub i{width} {old}, {operand}")
+                zero = self.value(f"icmp eq i{width} {val}, 0")
+                negative = self.value(f"icmp slt i{width} {val}, 0")
+                signed_less = self.value(f"icmp slt i{width} {old}, {operand}")
+                overflow = self.value(f"xor i1 {negative}, {signed_less}")
+                self.store("i1", zero, "zf")
+                self.store("i1", negative, "sf")
+                self.store("i1", overflow, "of")
+                self.store("i1", signed_less, "signed_less")
+                self.zero = self.signed = self.overflow = True
+            elif op in {"lock or", "lock and"}:
+                operand = self.read(ins, args[1], width)
+                fn = "or" if op == "lock or" else "and"
+                old = self.value(f"atomicrmw {fn} ptr {ptr}, i{width} {operand} seq_cst")
+                val = self.value(f"{fn} i{width} {old}, {operand}")
+                zero = self.value(f"icmp eq i{width} {val}, 0")
+                negative = self.value(f"icmp slt i{width} {val}, 0")
+                self.store("i1", zero, "zf")
+                self.store("i1", negative, "sf")
+                self.store("i1", "false", "of")
+                self.store("i1", negative, "signed_less")
+                self.zero = self.signed = self.overflow = True
+            elif op == "lock bts":
+                index = self.read(ins, args[1], width)
+                mask = self.value(f"shl i{width} 1, {index}")
+                old = self.value(f"atomicrmw or ptr {ptr}, i{width} {mask} seq_cst")
+                shifted = self.value(f"lshr i{width} {old}, {index}")
+                self.store("i1", self.value(f"trunc i{width} {shifted} to i1"), "cf")
+                self.carry = True
+            self.jump(following, returns)
+            return
+        if op in {"lock inc", "lock dec", "lock or", "lock and", "lock cmpxchg", "lock add", "lock sub"}:
+            op = op.removeprefix("lock ")
+        if op == "ud2":
+            self.trap(f"RVA {ins.address:#x}: ud2 instruction")
+            return
+        if op == "int" and args and args[0].type == x.X86_OP_IMM and args[0].imm == 0x29:
+            self.trap(f"RVA {ins.address:#x}: fast fail (int 29h)")
+            return
+        if op == "xchg":
+            a, b = args[:2]
+            width = args[0].size * 8
+            if a.type == x.X86_OP_MEM or b.type == x.X86_OP_MEM:
+                mem_arg, reg_arg = (a, b) if a.type == x.X86_OP_MEM else (b, a)
+                addr = self.address(ins, mem_arg)
+                ptr = self.value(f"call ptr @guest_pointer(i64 {addr}, i32 {width // 8})")
+                val = self.read(ins, reg_arg, width)
+                old = self.value(f"atomicrmw xchg ptr {ptr}, i{width} {val} seq_cst")
+                self.write(ins, reg_arg, old)
+            else:
+                val_a = self.read(ins, a, width)
+                val_b = self.read(ins, b, width)
+                self.write(ins, a, val_b)
+                self.write(ins, b, val_a)
+            self.jump(following, returns)
+            return
         if op == "call":
             operand = args[0]
             cfg_call = (operand.type == x.X86_OP_MEM and operand.mem.base == x.X86_REG_RIP
                         and not operand.mem.segment and self.address(ins, operand) in self.cfg_dispatch_slots)
-            non_iat_mem = (operand.type == x.X86_OP_MEM and (operand.mem.base != x.X86_REG_RIP or
-                           (int(self.address(ins, operand)) not in self.iat_labels and int(self.address(ins, operand)) not in self.imports)))
-            if operand.type == x.X86_OP_REG or cfg_call or non_iat_mem:
+            rip_slot = (int(self.address(ins, operand)) - self.module_base
+                        if operand.type == x.X86_OP_MEM and operand.mem.base == x.X86_REG_RIP
+                        else None)
+            non_iat_mem = (operand.type == x.X86_OP_MEM and rip_slot not in self.iat_labels
+                           and rip_slot not in self.imports)
+            if (operand.type == x.X86_OP_REG or cfg_call or non_iat_mem
+                    or (self.module_base and rip_slot in self.foreign_iat)):
                 target = self.read_reg("rax", 64) if cfg_call else self.read(ins, operand, 64)
                 self.guarded_call(ins, target, following, returns)
                 return
@@ -658,9 +1143,16 @@ class ConsoleLift(Lift):
                 raise ValueError("expected a plain return from an internal call")
             self.return_to_caller(returns)
             return
-        if op in {"jmp", "je", "jne", "ja", "jae", "jb", "jbe", "jl", "jge", "jg", "jle", "jo", "jno", "js", "jns"}:
+        if op in {"jmp", "je", "jne", "ja", "jae", "jb", "jbe", "jl", "jge", "jg", "jle", "jo", "jno", "js", "jns", "jp"}:
             operand = args[0]
-            if self.shared and op == "jmp" and operand.type == x.X86_OP_REG:
+            if self.shared and op == "jmp" and operand.type in (x.X86_OP_REG, x.X86_OP_MEM):
+                if (self.module_base and operand.type == x.X86_OP_MEM
+                        and operand.mem.base == x.X86_REG_RIP
+                        and int(self.address(ins, operand)) - self.module_base in self.imports
+                        and int(self.address(ins, operand)) - self.module_base not in self.foreign_iat):
+                    if not self.import_call(ins, tail=True):
+                        self.return_to_caller(returns)
+                    return
                 if self.crt_fill_jump(ins, returns):
                     return
                 self.guarded_call(ins, self.read(ins, operand, 64), following, returns, tail=True)
@@ -680,11 +1172,14 @@ class ConsoleLift(Lift):
             if op == "jmp":
                 target = args[0].imm
                 bound = self.runtime_functions.get(self.current) if self.shared else None
-                if bound and not self.current <= target < bound and target in self.runtime_functions:
+                if bound and not self.current <= target < bound:
                     self.line(f"  musttail call void @{self.function(target)}(ptr %cpu, i64 %return_va)")
                     self.line("  ret void")
                 else:
                     self.jump(target, returns)
+                return
+            if op == "jp":
+                self.jump(following, returns)
                 return
             if (op in {"je", "jne", "ja", "jbe", "jg", "jle"} and not self.zero
                     or op in {"ja", "jae", "jb", "jbe"} and not self.carry
@@ -776,7 +1271,201 @@ class ConsoleLift(Lift):
                     self.line(f"  store i8 128, ptr %{name}_0_width")
                 self.jump(following, returns)
                 return
-        if op in {"movups", "movaps", "movdqu", "movdqa", "pxor", "xorps", "punpcklqdq", "punpcklbw", "pshuflw", "pshufd", "pcmpeqw", "pcmpeqb", "pmovmskb", "paddd", "movd", "movq", "movsd"}:
+        if op == "movss":
+            dest, source = args
+            if dest.type == x.X86_OP_MEM:
+                value = self.load("i64", f"{ins.reg_name(source.reg)}_0")
+                address = self.address(ins, dest)
+                self.line(f"  call void @guest_store(i64 {address}, i64 {value}, i32 4)")
+            else:
+                name = ins.reg_name(dest.reg)
+                if source.type == x.X86_OP_MEM:
+                    value = self.value(f"zext i32 {self.read(ins, source, 32)} to i64")
+                    self.store("i64", "0", f"{name}_1")
+                else:
+                    source_value = self.load("i64", f"{ins.reg_name(source.reg)}_0")
+                    value = self.value(f"and i64 {source_value}, 4294967295")
+                    previous = self.load("i64", f"{name}_0")
+                    upper = self.value(f"and i64 {previous}, -4294967296")
+                    value = self.value(f"or i64 {upper}, {value}")
+                self.store("i64", value, f"{name}_0")
+            self.jump(following, returns)
+            return
+        if op in {"movhps", "movhpd", "movlps", "movlpd"}:
+            dest, source = args[:2]
+            lane = 1 if "h" in op else 0
+            if dest.type == x.X86_OP_REG and source.type == x.X86_OP_MEM:
+                name = ins.reg_name(dest.reg)
+                if not name.startswith("xmm"):
+                    raise ValueError(f"expected XMM destination for {op}")
+                val = self.read(ins, source, 64)
+                self.store("i64", val, f"{name}_{lane}")
+                self.defined[name] = 128
+                if self.shared:
+                    self.line(f"  store i8 128, ptr %{name}_0_width")
+                self.jump(following, returns)
+                return
+            elif dest.type == x.X86_OP_MEM and source.type == x.X86_OP_REG:
+                name = ins.reg_name(source.reg)
+                if not name.startswith("xmm"):
+                    raise ValueError(f"expected XMM source for {op}")
+                val = self.load("i64", f"{name}_{lane}")
+                addr = self.address(ins, dest)
+                self.line(f"  call void @guest_store(i64 {addr}, i64 {val}, i32 8)")
+                self.jump(following, returns)
+                return
+        if op in {"addsd", "subsd", "mulsd", "divsd", "sqrtsd", "maxsd", "minsd"}:
+            name = ins.reg_name(args[0].reg)
+            d_low = self.load("i64", f"{name}_0")
+            if op == "sqrtsd":
+                src = args[1] if len(args) > 1 else args[0]
+                if src.type == x.X86_OP_REG:
+                    s_low = self.load("i64", f"{ins.reg_name(src.reg)}_0")
+                else:
+                    addr = self.address(ins, src)
+                    s_low = self.value(f"call i64 @guest_load(i64 {addr}, i32 8)")
+                s_f = self.value(f"bitcast i64 {s_low} to double")
+                res_f = self.value(f"call double @llvm.sqrt.f64(double {s_f})")
+            else:
+                src = args[1]
+                if src.type == x.X86_OP_REG:
+                    s_low = self.load("i64", f"{ins.reg_name(src.reg)}_0")
+                else:
+                    addr = self.address(ins, src)
+                    s_low = self.value(f"call i64 @guest_load(i64 {addr}, i32 8)")
+                d_f = self.value(f"bitcast i64 {d_low} to double")
+                s_f = self.value(f"bitcast i64 {s_low} to double")
+                if op == "addsd":
+                    res_f = self.value(f"fadd double {d_f}, {s_f}")
+                elif op == "subsd":
+                    res_f = self.value(f"fsub double {d_f}, {s_f}")
+                elif op == "mulsd":
+                    res_f = self.value(f"fmul double {d_f}, {s_f}")
+                elif op == "divsd":
+                    res_f = self.value(f"fdiv double {d_f}, {s_f}")
+                elif op == "maxsd":
+                    res_f = self.value(f"call double @llvm.maxnum.f64(double {d_f}, double {s_f})")
+                elif op == "minsd":
+                    res_f = self.value(f"call double @llvm.minnum.f64(double {d_f}, double {s_f})")
+            res_i = self.value(f"bitcast double {res_f} to i64")
+            self.store("i64", res_i, f"{name}_0")
+            self.jump(following, returns)
+            return
+        if op in {"ucomisd", "comisd"}:
+            name = ins.reg_name(args[0].reg)
+            d_low = self.load("i64", f"{name}_0")
+            src = args[1]
+            if src.type == x.X86_OP_REG:
+                s_low = self.load("i64", f"{ins.reg_name(src.reg)}_0")
+            else:
+                addr = self.address(ins, src)
+                s_low = self.value(f"call i64 @guest_load(i64 {addr}, i32 8)")
+            d_f = self.value(f"bitcast i64 {d_low} to double")
+            s_f = self.value(f"bitcast i64 {s_low} to double")
+            eq = self.value(f"fcmp oeq double {d_f}, {s_f}")
+            lt = self.value(f"fcmp olt double {d_f}, {s_f}")
+            un = self.value(f"fcmp uno double {d_f}, {s_f}")
+            zf = self.value(f"or i1 {eq}, {un}")
+            cf = self.value(f"or i1 {lt}, {un}")
+            self.store("i1", zf, "zf")
+            self.store("i1", cf, "cf")
+            self.store("i1", "0", "of")
+            self.store("i1", "0", "sf")
+            self.store("i1", "0", "signed_less")
+            self.zero = self.carry = self.overflow = self.signed = True
+            self.jump(following, returns)
+            return
+        if op == "cvtsi2sd":
+            name = ins.reg_name(args[0].reg)
+            src_width = args[1].size * 8
+            src_val = self.read(ins, args[1], src_width)
+            f_val = self.value(f"sitofp i{src_width} {src_val} to double")
+            i_val = self.value(f"bitcast double {f_val} to i64")
+            self.store("i64", i_val, f"{name}_0")
+            self.jump(following, returns)
+            return
+        if op == "cvttsd2si":
+            dest_width = args[0].size * 8
+            src = args[1]
+            if src.type == x.X86_OP_REG:
+                s_low = self.load("i64", f"{ins.reg_name(src.reg)}_0")
+            else:
+                addr = self.address(ins, src)
+                s_low = self.value(f"call i64 @guest_load(i64 {addr}, i32 8)")
+            d_f = self.value(f"bitcast i64 {s_low} to double")
+            i_val = self.value(f"fptosi double {d_f} to i{dest_width}")
+            self.write(ins, args[0], i_val)
+            self.jump(following, returns)
+            return
+        if op in {"fninit", "fldz", "fnstsw", "fld", "fild", "fstp", "fxch", "faddp", "fucomi", "fcompi", "fscale", "fprem", "fprem1"}:
+            if op == "fninit":
+                self.line("  call void @guest_fninit()")
+            elif op == "fldz":
+                self.line("  call void @guest_fldz()")
+            elif op == "fnstsw":
+                sw = self.value("call i16 @guest_fnstsw()")
+                if args and args[0].type == x.X86_OP_REG and ins.reg_name(args[0].reg) in ("ax", "eax", "rax"):
+                    self.write_reg("rax", 16, sw)
+                elif args:
+                    addr = self.address(ins, args[0])
+                    self.line(f"  call void @guest_store(i64 {addr}, i64 {self.value(f'zext i16 {sw} to i64')}, i32 2)")
+            elif op == "fld":
+                if args[0].type == x.X86_OP_REG:
+                    idx = int(ins.reg_name(args[0].reg)[3:-1]) if "(" in ins.reg_name(args[0].reg) else 0
+                    self.line(f"  call void @guest_fld_st(i32 {idx})")
+                else:
+                    addr = self.address(ins, args[0])
+                    size = args[0].size
+                    if size in (10, 16):
+                        self.line(f"  call void @guest_fld_f80(i64 {addr})")
+                    elif size == 8:
+                        self.line(f"  call void @guest_fld_f64(i64 {addr})")
+                    else:
+                        self.line(f"  call void @guest_fld_f32(i64 {addr})")
+            elif op == "fild":
+                addr = self.address(ins, args[0])
+                size = args[0].size
+                ival = self.value(f"call i64 @guest_load(i64 {addr}, i32 {size})")
+                if size < 8:
+                    ival = self.value(f"sext i{size*8} {self.value(f'trunc i64 {ival} to i{size*8}')} to i64")
+                self.line(f"  call void @guest_fild(i64 {ival})")
+            elif op == "fstp":
+                if args[0].type == x.X86_OP_REG:
+                    idx = int(ins.reg_name(args[0].reg)[3:-1]) if "(" in ins.reg_name(args[0].reg) else 0
+                    self.line(f"  call void @guest_fstp_st(i32 {idx})")
+                else:
+                    addr = self.address(ins, args[0])
+                    size = args[0].size
+                    if size in (10, 16):
+                        self.line(f"  call void @guest_fstp_f80(i64 {addr})")
+                    elif size == 8:
+                        self.line(f"  call void @guest_fstp_f64(i64 {addr})")
+                    else:
+                        self.line(f"  call void @guest_fstp_f32(i64 {addr})")
+            elif op == "fxch":
+                idx = int(ins.reg_name(args[0].reg)[3:-1]) if args and "(" in ins.reg_name(args[0].reg) else 1
+                self.line(f"  call void @guest_fxch(i32 {idx})")
+            elif op == "faddp":
+                idx = int(ins.reg_name(args[0].reg)[3:-1]) if args and "(" in ins.reg_name(args[0].reg) else 1
+                self.line(f"  call void @guest_faddp(i32 {idx})")
+            elif op in {"fucomi", "fcompi"}:
+                idx = int(ins.reg_name(args[0].reg)[3:-1]) if args and "(" in ins.reg_name(args[0].reg) else 1
+                flags = self.value(f"call i32 @guest_fcompi(i32 {idx}, i32 1)")
+                zf = self.value(f"trunc i32 {self.value(f'and i32 {flags}, 1')} to i1")
+                cf = self.value(f"trunc i32 {self.value(f'lshr i32 {self.value(f'and i32 {flags}, 2')}, 1')} to i1")
+                self.store("i1", zf, "zf")
+                self.store("i1", cf, "cf")
+                self.store("i1", "0", "of")
+                self.store("i1", "0", "sf")
+                self.store("i1", "0", "signed_less")
+                self.zero = self.carry = self.overflow = self.signed = True
+            elif op == "fscale":
+                self.line("  call void @guest_fscale()")
+            elif op in {"fprem", "fprem1"}:
+                self.line("  call void @guest_fprem()")
+            self.jump(following, returns)
+            return
+        if op in {"movups", "movupd", "packuswb", "pinsrw", "pextrw", "movaps", "movapd", "movdqu", "movdqa", "pxor", "xorps", "xorpd", "pand", "andps", "andpd", "por", "orps", "orpd", "pandn", "andnps", "andnpd", "punpcklqdq", "unpcklpd", "punpckhqdq", "unpckhpd", "movlhps", "movhlps", "punpckldq", "punpcklbw", "punpckhbw", "punpcklwd", "pshuflw", "pshufhw", "pshufd", "pcmpeqw", "pcmpeqb", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pmovmskb", "movmskps", "movmskpd", "paddd", "paddq", "psubd", "psubq", "movd", "movq", "movsd", "shufpd", "shufps", "psrldq", "pslldq", "psllw", "psrlw", "pslld", "psrld", "psllq", "psrlq"}:
             dest, source = args[:2]
             def vector(operand):
                 if operand.type == x.X86_OP_REG:
@@ -797,38 +1486,158 @@ class ConsoleLift(Lift):
                 self.write(ins, dest, value)
                 self.jump(following, returns)
                 return
-            if op == "pmovmskb":
+            if op in {"pmovmskb", "movmskps", "movmskpd"}:
                 low, high = vector(source)
-                value = self.value(f"call i32 @guest_vector_mask(i64 {low}, i64 {high})")
+                if op == "movmskpd":
+                    low_bit = self.value(f"lshr i64 {low}, 63")
+                    high_bit = self.value(f"lshr i64 {high}, 63")
+                    high_bit = self.value(f"shl i64 {high_bit}, 1")
+                    bits = self.value(f"or i64 {low_bit}, {high_bit}")
+                    value = self.value(f"trunc i64 {bits} to i32")
+                else:
+                    fn = "guest_movmskps" if op == "movmskps" else "guest_vector_mask"
+                    value = self.value(f"call i32 @{fn}(i64 {low}, i64 {high})")
                 self.write(ins, dest, value)
                 self.jump(following, returns)
                 return
-            if op == "paddd":
+            if op in {"paddd", "psubd"}:
                 output = []
                 for a, b in zip(vector(dest), vector(source)):
                     left = self.value(f"bitcast i64 {a} to <2 x i32>")
                     right = self.value(f"bitcast i64 {b} to <2 x i32>")
-                    total = self.value(f"add <2 x i32> {left}, {right}")
+                    math_op = "add" if op == "paddd" else "sub"
+                    total = self.value(f"{math_op} <2 x i32> {left}, {right}")
                     output.append(self.value(f"bitcast <2 x i32> {total} to i64"))
                 values = output
-            elif op in {"pcmpeqw", "pcmpeqb"}:
-                values = tuple(self.value(f"call i64 @guest_compare_words(i64 {a}, i64 {b}, i32 {16 if op.endswith('w') else 8})")
-                               for a, b in zip(vector(dest), vector(source)))
-            elif op in {"punpcklbw", "pshuflw", "pshufd"}:
+            elif op in {"paddq", "psubq"}:
+                math_op = "add" if op == "paddq" else "sub"
+                values = tuple(self.value(f"{math_op} i64 {a}, {b}") for a, b in zip(vector(dest), vector(source)))
+            elif op in {"pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd"}:
+                is_gt = op.startswith("pcmpgt")
+                if dest.type == x.X86_OP_REG and source.type == x.X86_OP_REG and dest.reg == source.reg:
+                    values = ("0", "0") if is_gt else ("-1", "-1")
+                else:
+                    lanes = 8 if op.endswith("b") else (4 if op.endswith("w") else 2)
+                    elem_w = 8 if op.endswith("b") else (16 if op.endswith("w") else 32)
+                    predicate = "sgt" if is_gt else "eq"
+                    output = []
+                    for a, b in zip(vector(dest), vector(source)):
+                        left = self.value(f"bitcast i64 {a} to <{lanes} x i{elem_w}>")
+                        right = self.value(f"bitcast i64 {b} to <{lanes} x i{elem_w}>")
+                        cmp_res = self.value(f"icmp {predicate} <{lanes} x i{elem_w}> {left}, {right}")
+                        extended = self.value(f"sext <{lanes} x i1> {cmp_res} to <{lanes} x i{elem_w}>")
+                        output.append(self.value(f"bitcast <{lanes} x i{elem_w}> {extended} to i64"))
+                    values = output
+            elif op in {"punpcklbw", "punpckhbw", "pshuflw", "pshufhw", "pshufd"}:
                 low, high = vector(source)
-                other = vector(dest)[0] if op == "punpcklbw" else "0"
-                control = args[2].imm if op != "punpcklbw" else 0
+                unpack = op in {"punpcklbw", "punpckhbw"}
+                if unpack:
+                    selected = int(op == "punpckhbw")
+                    other = vector(dest)[selected]
+                    low = high if selected else low
+                    operation, control = 0, 0
+                else:
+                    other = "0"
+                    operation = {"pshuflw": 1, "pshufd": 2, "pshufhw": 1}[op]
+                    control = args[2].imm
+                    if op == "pshufhw":
+                        low, high = high, low
                 output = []
                 for lane in range(2):
                     value = self.value(f"call i64 @guest_shuffle(i64 {low}, i64 {high}, i64 {other}, "
-                                       f"i32 {('punpcklbw', 'pshuflw', 'pshufd').index(op)}, i32 {control}, i32 {lane})")
+                                       f"i32 {operation}, i32 {control}, i32 {lane})")
                     output.append(value)
-                values = output
-            elif op == "punpcklqdq":
+                values = output[::-1] if op == "pshufhw" else output
+            elif op == "packuswb":
+                packed = []
+                for operand in (dest, source):
+                    low, high = vector(operand)
+                    packed.append(self.value(f"call i64 @guest_packuswb(i64 {low}, i64 {high})"))
+                values = tuple(packed)
+            elif op == "pextrw":
+                word = args[2].imm & 7
+                lane = vector(source)[word // 4]
+                shifted = self.value(f"lshr i64 {lane}, {(word % 4) * 16}")
+                unit = self.value(f"trunc i64 {shifted} to i16")
+                value = self.value(f"zext i16 {unit} to i{dest.size * 8}")
+                self.write(ins, dest, value)
+                self.jump(following, returns)
+                return
+            elif op == "pinsrw":
+                values = list(vector(dest))
+                word = args[2].imm & 7
+                lane, shift = word // 4, (word % 4) * 16
+                unit = self.read(ins, source, 16 if source.type == x.X86_OP_MEM else 32)
+                if source.type == x.X86_OP_REG:
+                    unit = self.value(f"trunc i32 {unit} to i16")
+                unit = self.value(f"zext i16 {unit} to i64")
+                unit = self.value(f"shl i64 {unit}, {shift}")
+                old = self.value(f"and i64 {values[lane]}, {~(65535 << shift)}")
+                values[lane] = self.value(f"or i64 {old}, {unit}")
+            elif op in {"punpcklqdq", "unpcklpd", "movlhps"}:
                 values = (vector(dest)[0], vector(source)[0])
-            elif op in {"pxor", "xorps"}:
-                values = ("0", "0") if dest.reg == source.reg else tuple(
+            elif op in {"punpckhqdq", "unpckhpd"}:
+                values = (vector(dest)[1], vector(source)[1])
+            elif op == "movhlps":
+                values = (vector(source)[1], vector(dest)[1])
+            elif op == "punpckldq":
+                d_low = vector(dest)[0]
+                s_low = vector(source)[0]
+                d0 = self.value(f"and i64 {d_low}, 4294967295")
+                d1 = self.value(f"lshr i64 {d_low}, 32")
+                s0 = self.value(f"shl i64 {s_low}, 32")
+                s1 = self.value(f"and i64 {s_low}, -4294967296")
+                values = (self.value(f"or i64 {d0}, {s0}"), self.value(f"or i64 {d1}, {s1}"))
+            elif op == "punpcklwd":
+                d0, s0 = vector(dest)[0], vector(source)[0]
+                v0 = self.value(f"call i64 @guest_punpcklwd(i64 {d0}, i64 {s0}, i32 0)")
+                v1 = self.value(f"call i64 @guest_punpcklwd(i64 {d0}, i64 {s0}, i32 1)")
+                values = (v0, v1)
+            elif op in {"pxor", "xorps", "xorpd"}:
+                values = ("0", "0") if dest.type == x.X86_OP_REG and source.type == x.X86_OP_REG and dest.reg == source.reg else tuple(
                     self.value(f"xor i64 {left}, {right}") for left, right in zip(vector(dest), vector(source)))
+            elif op in {"pand", "andps", "andpd"}:
+                values = tuple(self.value(f"and i64 {left}, {right}") for left, right in zip(vector(dest), vector(source)))
+            elif op in {"por", "orps", "orpd"}:
+                values = tuple(self.value(f"or i64 {left}, {right}") for left, right in zip(vector(dest), vector(source)))
+            elif op in {"pandn", "andnps", "andnpd"}:
+                values = tuple(self.value(f"and i64 {self.value(f'xor i64 {left}, -1')}, {right}") for left, right in zip(vector(dest), vector(source)))
+            elif op in {"psrldq", "pslldq"}:
+                shift = (args[1].imm & 255) * 8
+                if shift >= 128:
+                    values = ("0", "0")
+                else:
+                    low, high = vector(dest)
+                    lo = self.value(f"zext i64 {low} to i128")
+                    hi = self.value(f"zext i64 {high} to i128")
+                    hi = self.value(f"shl i128 {hi}, 64")
+                    wide = self.value(f"or i128 {lo}, {hi}")
+                    direction = "shl" if op == "pslldq" else "lshr"
+                    result = self.value(f"{direction} i128 {wide}, {shift}")
+                    lo = self.value(f"trunc i128 {result} to i64")
+                    hi = self.value(f"lshr i128 {result}, 64")
+                    hi = self.value(f"trunc i128 {hi} to i64")
+                    values = (lo, hi)
+            elif op in {"psllw", "psrlw", "pslld", "psrld", "psllq", "psrlq"}:
+                kind = {"psllw": 0, "psrlw": 1, "pslld": 2, "psrld": 3, "psllq": 4, "psrlq": 5}[op]
+                if source.type == x.X86_OP_IMM:
+                    count_val = str(source.imm)
+                else:
+                    count_val = vector(source)[0]
+                values = tuple(self.value(f"call i64 @guest_vector_shift(i64 {val}, i64 {count_val}, i32 {kind})")
+                               for val in vector(dest))
+            elif op == "shufps":
+                imm = args[2].imm if len(args) > 2 else 0
+                d0, d1 = vector(dest)
+                s0, s1 = vector(source)
+                v0 = self.value(f"call i64 @guest_shufps(i64 {d0}, i64 {d1}, i64 {s0}, i64 {s1}, i32 {imm}, i32 0)")
+                v1 = self.value(f"call i64 @guest_shufps(i64 {d0}, i64 {d1}, i64 {s0}, i64 {s1}, i32 {imm}, i32 1)")
+                values = (v0, v1)
+            elif op == "shufpd":
+                imm = args[2].imm if len(args) > 2 else 0
+                d_vec = vector(dest)
+                s_vec = vector(source)
+                values = (d_vec[imm & 1], s_vec[(imm >> 1) & 1])
             else:
                 values = vector(source)
             if dest.type == x.X86_OP_REG:
@@ -847,13 +1656,30 @@ class ConsoleLift(Lift):
                     self.line(f"  call void @guest_store(i64 {at}, i64 {value}, i32 8)")
             self.jump(following, returns)
             return
-        if op == "nop":
+        if op == "int3":
+            self.trap("int3 breakpoint")
+            return
+        if op in {"nop", "pause"}:
             self.jump(following, returns)
             return
         width = args[0].size * 8 if args else 0
         if op == "cdqe":
             low = self.read_reg("rax", 32)
             self.write_reg("rax", 64, self.value(f"sext i32 {low} to i64"))
+        elif op == "cdq":
+            low = self.read_reg("rax", 32)
+            extended = self.value(f"ashr i32 {low}, 31")
+            self.write_reg("rdx", 64, self.value(f"zext i32 {extended} to i64"))
+        elif op == "cqo":
+            val = self.read_reg("rax", 64)
+            extended = self.value(f"ashr i64 {val}, 63")
+            self.write_reg("rdx", 64, extended)
+        elif op == "cwde":
+            low = self.read_reg("rax", 16)
+            self.write_reg("rax", 64, self.value(f"zext i32 {self.value(f'sext i16 {low} to i32')} to i64"))
+        elif op == "cbw":
+            low = self.read_reg("rax", 8)
+            self.write_reg("rax", 16, self.value(f"sext i8 {low} to i16"))
         elif op == "mov" or (op == "movabs" and args[1].type == x.X86_OP_IMM):
             if self.shared and width in (32, 64) and args[0].type == args[1].type == x.X86_OP_REG:
                 dest, _ = self.reg(ins, args[0])
@@ -879,9 +1705,19 @@ class ConsoleLift(Lift):
             source_width = args[1].size * 8
             source = self.read(ins, args[1], source_width)
             extension = "zext" if op == "movzx" else "sext"
-            self.write(ins, args[0], self.value(f"{extension} i{source_width} {source} to i{width}"))
+            value = source if source_width == width else self.value(
+                f"{extension} i{source_width} {source} to i{width}")
+            self.write(ins, args[0], value)
         elif op == "lea" and width in (32, 64):
             address = self.address(ins, args[1])
+            if self.modules and self.shared and args[1].mem.base == x.X86_REG_RIP:
+                rva = int(address) - self.module_base
+                section = self.image.get_section_by_rva(rva)
+                if section and section.Characteristics & 0x20000000:
+                    self.function(rva)
+                elif section and 0 < rva <= 0xffff:
+                    # Keep low data pointers distinguishable from GetProcAddress ordinals.
+                    address = str(self.image_base + rva)
             value = address if width == 64 else self.value(f"trunc i64 {address} to i32")
             self.write(ins, args[0], value)
         elif op in {"bt", "btr", "bts"} and args[0].type == x.X86_OP_REG and args[1].type in (x.X86_OP_REG, x.X86_OP_IMM):
@@ -897,21 +1733,24 @@ class ConsoleLift(Lift):
                 mask = self.value(f"shl i{width} 1, {index}")
                 inverse = self.value(f"xor i{width} {mask}, -1")
                 self.write(ins, args[0], self.value(f"and i{width} {value}, {inverse}"))
-        elif op in {"xadd", "lock xadd"} and args[0].type == x.X86_OP_MEM and args[1].type == x.X86_OP_REG:
-            left, right = (self.read(ins, arg, width) for arg in args)
-            total = self.value(f"add i{width} {left}, {right}")
-            self.write(ins, args[0], total)
-            self.write(ins, args[1], left)
-            self.zero = self.carry = self.signed = self.overflow = False
-        elif op == "xchg" and args[0].type == x.X86_OP_MEM and args[1].type == x.X86_OP_REG:
-            addr = self.address(ins, args[0])
-            value = self.read(ins, args[1], width)
-            wide = value if width == 64 else self.value(f"zext i{width} {value} to i64")
-            previous = self.value(f"call i64 @guest_load(i64 {addr}, i32 {width // 8})")
-            self.line(f"  call void @guest_store(i64 {addr}, i64 {wide}, i32 {width // 8})")
-            value = previous if width == 64 else self.value(f"trunc i64 {previous} to i{width}")
-            self.write(ins, args[1], value)
-        elif op == "cmpxchg" and width in (32, 64) and args[1].type == x.X86_OP_REG:
+        elif op in {"xadd", "lock xadd"}:
+            if args[0].type == x.X86_OP_MEM and args[1].type == x.X86_OP_REG:
+                addr = self.address(ins, args[0])
+                ptr = self.value(f"call ptr @guest_pointer(i64 {addr}, i32 {width // 8})")
+                right = self.read(ins, args[1], width)
+                old = self.value(f"atomicrmw add ptr {ptr}, i{width} {right} seq_cst")
+                total = self.value(f"add i{width} {old}, {right}")
+                self.write(ins, args[1], old)
+            else:
+                left, right = (self.read(ins, arg, width) for arg in args)
+                total = self.value(f"add i{width} {left}, {right}")
+                self.write(ins, args[0], total)
+                self.write(ins, args[1], left)
+            self.store("i1", self.value(f"icmp eq i{width} {total}, 0"), "zf")
+            self.zero = True
+            self.store("i1", self.value(f"icmp slt i{width} {total}, 0"), "sf")
+            self.carry = self.overflow = False
+        elif op == "cmpxchg" and width in (8, 16, 32, 64) and args[1].type == x.X86_OP_REG:
             expected = self.read_reg("rax", width)
             replacement = self.read(ins, args[1], width)
             if args[0].type == x.X86_OP_MEM:
@@ -970,6 +1809,14 @@ class ConsoleLift(Lift):
             value = self.value(f"mul i{width} {left}, {right}")
             self.write(ins, args[0], value)
             self.zero = self.carry = self.signed = self.overflow = False
+        elif op == "imul" and len(args) == 1:
+            operands = [self.read(ins, args[0], width), self.read_reg("rax", width)]
+            extended = [self.value(f"sext i{width} {value} to i{width * 2}") for value in operands]
+            product = self.value(f"mul i{width * 2} {extended[0]}, {extended[1]}")
+            upper = self.value(f"lshr i{width * 2} {product}, {width}")
+            for register, value in (("rax", product), ("rdx", upper)):
+                self.write_reg(register, width, self.value(f"trunc i{width * 2} {value} to i{width}"))
+            self.zero = self.carry = self.signed = self.overflow = False
         elif op == "div" and width == 32:
             parts = [self.read_reg(name, 32) for name in ("rdx", "rax")]
             high, low = (self.value(f"zext i32 {part} to i64") for part in parts)
@@ -986,6 +1833,24 @@ class ConsoleLift(Lift):
             high = self.read_reg("rdx", 64)
             low = self.read_reg("rax", 64)
             self.line(f"  call void @guest_div(i64 {high}, i64 {low}, i64 {denominator}, ptr %rax, ptr %rdx)")
+            self.write_reg("rax", 64, self.load("i64", "rax"))
+            self.write_reg("rdx", 64, self.load("i64", "rdx"))
+            self.zero = self.carry = self.signed = self.overflow = False
+        elif op == "idiv" and width == 32:
+            parts = [self.read_reg(name, 32) for name in ("rdx", "rax")]
+            high, low = (self.value(f"zext i32 {part} to i64") for part in parts)
+            top = self.value(f"shl i64 {high}, 32")
+            combined = self.value(f"or i64 {top}, {low}")
+            denominator = self.read(ins, args[0], 32)
+            self.line(f"  call void @guest_idiv32(i64 {combined}, i32 {denominator}, ptr %rax, ptr %rdx)")
+            self.write_reg("rax", 64, self.load("i64", "rax"))
+            self.write_reg("rdx", 64, self.load("i64", "rdx"))
+            self.zero = self.carry = self.signed = self.overflow = False
+        elif op == "idiv" and width == 64:
+            denominator = self.read(ins, args[0], 64)
+            high = self.read_reg("rdx", 64)
+            low = self.read_reg("rax", 64)
+            self.line(f"  call void @guest_idiv(i64 {high}, i64 {low}, i64 {denominator}, ptr %rax, ptr %rdx)")
             self.write_reg("rax", 64, self.load("i64", "rax"))
             self.write_reg("rdx", 64, self.load("i64", "rdx"))
             self.zero = self.carry = self.signed = self.overflow = False
@@ -1027,9 +1892,13 @@ class ConsoleLift(Lift):
             self.store("i1", self.value(f"xor i1 {negative}, {overflow}"), "signed_less")
             self.store("i1", self.value(f"icmp eq i{width} {value}, 0"), "zf")
             self.store("i1", carry, "cf")
-            self.overflow = False
+            self.store("i1", overflow, "of")
+            self.overflow = True
             self.zero = self.carry = self.signed = True
             self.write(ins, args[0], value)
+        elif op == "bswap" and width in (32, 64):
+            value = self.read(ins, args[0], width)
+            self.write(ins, args[0], self.value(f"call i{width} @llvm.bswap.i{width}(i{width} {value})"))
         elif op == "not":
             value = self.read(ins, args[0], width)
             self.write(ins, args[0], self.value(f"xor i{width} {value}, -1"))
@@ -1057,21 +1926,77 @@ class ConsoleLift(Lift):
                     zero = self.value(f"select i1 {unchanged}, i1 {prior_zero}, i1 {zero}")
                 self.store("i1", zero, "zf")
                 self.zero = self.zero or args[1].type == x.X86_OP_IMM
-                self.carry = self.signed = self.overflow = False
+                negative = self.value(f"icmp slt i{width} {value}, 0")
+                if args[1].type != x.X86_OP_IMM and self.signed:
+                    unchanged = self.value(f"icmp eq i{shift_width} {count}, 0")
+                    prior_negative = self.load("i1", "sf")
+                    negative = self.value(f"select i1 {unchanged}, i1 {prior_negative}, i1 {negative}")
+                self.store("i1", negative, "sf")
+                self.store("i1", negative, "signed_less")
+                self.signed = self.signed or args[1].type == x.X86_OP_IMM
+                self.carry = self.overflow = False
                 self.write(ins, args[0], value)
-        elif op == "cmovs" and self.signed:
-            condition = self.load("i1", "sf")
+        elif op in {"shld", "shrd"} and width in (16, 32, 64):
+            dest_val = self.read(ins, args[0], width)
+            src_val = self.read(ins, args[1], width)
+            if args[2].type == x.X86_OP_IMM:
+                count_val = str(args[2].imm & (width - 1))
+            else:
+                byte = self.read(ins, args[2], 8)
+                wide = self.value(f"zext i8 {byte} to i{width}")
+                count_val = self.value(f"and i{width} {wide}, {width - 1}")
+            if op == "shld":
+                fn = f"@llvm.fshl.i{width}"
+                arg_a, arg_b = dest_val, src_val
+            else:
+                fn = f"@llvm.fshr.i{width}"
+                arg_a, arg_b = src_val, dest_val
+            value = self.value(f"call i{width} {fn}(i{width} {arg_a}, i{width} {arg_b}, i{width} {count_val})")
+            zero = self.value(f"icmp eq i{width} {value}, 0")
+            negative = self.value(f"icmp slt i{width} {value}, 0")
+            if args[2].type != x.X86_OP_IMM and self.zero:
+                unchanged = self.value(f"icmp eq i{width} {count_val}, 0")
+                prior_zero = self.load("i1", "zf")
+                zero = self.value(f"select i1 {unchanged}, i1 {prior_zero}, i1 {zero}")
+            if args[2].type != x.X86_OP_IMM and self.signed:
+                unchanged = self.value(f"icmp eq i{width} {count_val}, 0")
+                prior_negative = self.load("i1", "sf")
+                negative = self.value(f"select i1 {unchanged}, i1 {prior_negative}, i1 {negative}")
+            self.store("i1", zero, "zf")
+            self.store("i1", negative, "sf")
+            self.store("i1", negative, "signed_less")
+            self.zero = self.zero or args[2].type == x.X86_OP_IMM
+            self.signed = self.signed or args[2].type == x.X86_OP_IMM
+            self.carry = self.overflow = False
+            self.write(ins, args[0], value)
+        elif (op in {"cmovs", "cmovns"} and self.signed
+              or op in {"cmovo", "cmovno"} and self.overflow):
+            condition = self.load("i1", "of" if op in {"cmovo", "cmovno"} else "sf")
+            if op in {"cmovns", "cmovno"}:
+                condition = self.value(f"xor i1 {condition}, true")
             old, candidate = (self.read(ins, arg, width) for arg in args)
             selected = self.value(f"select i1 {condition}, i{width} {candidate}, i{width} {old}")
             self.write(ins, args[0], selected)
-        elif op in {"cmove", "cmovne", "cmova", "cmovb", "cmovae"} and (self.zero or op in {"cmovb", "cmovae"}):
+        elif op in {"cmove", "cmovne", "cmova", "cmovb", "cmovae", "cmovbe"} and (self.zero or op in {"cmovb", "cmovae"}):
             condition = "false" if op in {"cmovb", "cmovae"} else self.load("i1", "zf")
-            if op in {"cmova", "cmovb", "cmovae"}:
+            if op in {"cmova", "cmovb", "cmovae", "cmovbe"}:
                 if not self.carry:
-                    raise ValueError("cmova reads undefined carry")
+                    raise ValueError(f"{op} reads undefined carry")
                 carry = self.load("i1", "cf")
-                condition = self.value(f"or i1 {carry}, {condition}") if op == "cmova" else carry
+                condition = self.value(f"or i1 {carry}, {condition}") if op in {"cmova", "cmovbe"} else carry
             if op in {"cmovne", "cmova", "cmovae"}:
+                condition = self.value(f"xor i1 {condition}, true")
+            old, candidate = (self.read(ins, arg, width) for arg in args)
+            selected = self.value(f"select i1 {condition}, i{width} {candidate}, i{width} {old}")
+            self.write(ins, args[0], selected)
+        elif op in {"cmovl", "cmovge", "cmovle", "cmovg"} and self.signed:
+            condition = self.load("i1", "signed_less")
+            if op in {"cmovg", "cmovle"}:
+                if not self.zero:
+                    raise ValueError("cmovg reads undefined zero flag")
+                zero = self.load("i1", "zf")
+                condition = self.value(f"or i1 {condition}, {zero}")
+            if op in {"cmovge", "cmovg"}:
                 condition = self.value(f"xor i1 {condition}, true")
             old, candidate = (self.read(ins, arg, width) for arg in args)
             selected = self.value(f"select i1 {condition}, i{width} {candidate}, i{width} {old}")
@@ -1116,6 +2041,7 @@ class ConsoleLift(Lift):
             self.store("i1", negative, "sf")
             if op in {"sub", "cmp"}:
                 signed_less = self.value(f"icmp slt i{width} {lhs}, {rhs}")
+                overflow = self.value(f"xor i1 {negative}, {signed_less}")
             else:
                 signed_less = negative
                 if op == "add":
@@ -1124,9 +2050,12 @@ class ConsoleLift(Lift):
                     both = self.value(f"and i{width} {left}, {right}")
                     overflow = self.value(f"icmp slt i{width} {both}, 0")
                     signed_less = self.value(f"xor i1 {negative}, {overflow}")
+                else:
+                    overflow = "false"
+            self.store("i1", overflow, "of")
             self.store("i1", signed_less, "signed_less")
             self.signed = True
-            self.overflow = False
+            self.overflow = True
             if op not in {"test", "cmp"}:
                 self.write(ins, args[0], value)
         elif op in {"setb", "setae"} and self.carry:
@@ -1154,13 +2083,58 @@ class ConsoleLift(Lift):
             if op == "setns":
                 value = self.value(f"xor i1 {value}, true")
             self.write(ins, args[0], self.value(f"zext i1 {value} to i8"))
+        elif op in {"setl", "setge", "setle"} and self.signed:
+            value = self.load("i1", "signed_less")
+            if op == "setle":
+                if not self.zero:
+                    raise ValueError("setle reads undefined zero flag")
+                zero = self.load("i1", "zf")
+                value = self.value(f"or i1 {value}, {zero}")
+            elif op == "setge":
+                value = self.value(f"xor i1 {value}, true")
+            self.write(ins, args[0], self.value(f"zext i1 {value} to i8"))
+        elif op in {"seto", "setno"}:
+            if not self.overflow:
+                raise ValueError("seto reads undefined overflow")
+            value = self.load("i1", "of")
+            if op == "setno":
+                value = self.value(f"xor i1 {value}, true")
+            self.write(ins, args[0], self.value(f"zext i1 {value} to i8"))
+        elif op == "setp":
+            self.write(ins, args[0], "0")
+        elif op in {"bsr", "bsf"} and width in (32, 64):
+            src = self.read(ins, args[1], width)
+            zero = self.value(f"icmp eq i{width} {src}, 0")
+            self.store("i1", zero, "zf")
+            self.zero = True
+            self.carry = self.signed = self.overflow = False
+            if op == "bsf":
+                res = self.value(f"call i{width} @llvm.cttz.i{width}(i{width} {src}, i1 false)")
+            else:
+                lz = self.value(f"call i{width} @llvm.ctlz.i{width}(i{width} {src}, i1 false)")
+                res = self.value(f"sub i{width} {width - 1}, {lz}")
+            self.write(ins, args[0], res)
+        elif op in {"tzcnt", "lzcnt"} and width in (32, 64):
+            src = self.read(ins, args[1], width)
+            fn = f"@llvm.cttz.i{width}" if op == "tzcnt" else f"@llvm.ctlz.i{width}"
+            res = self.value(f"call i{width} {fn}(i{width} {src}, i1 false)")
+            src_zero = self.value(f"icmp eq i{width} {src}, 0")
+            res_zero = self.value(f"icmp eq i{width} {res}, 0")
+            self.store("i1", src_zero, "cf")
+            self.store("i1", res_zero, "zf")
+            self.carry = True
+            self.zero = True
+            self.signed = self.overflow = False
+            self.write(ins, args[0], res)
         elif op in {"nop", "fninit", "cld"}:
             pass
         else:
             raise ValueError("unsupported console instruction")
         self.jump(following, returns)
 
-    def emit_console(self, entry, base, code, data):
+    def emit_console(self, entry, base, code, data, *, module=None):
+        self.module_base = self.image_base if module else 0
+        prefix = f"{module}_" if module else ""
         descriptors = []
         for index, (rva, blob, size, writable) in enumerate(data):
             symbol = f"@guest_section_{index}"
@@ -1169,14 +2143,31 @@ class ConsoleLift(Lift):
                 self.line(f'{symbol} = private constant [{len(blob)} x i8] c"{contents}"')
             pointer = symbol if blob else "null"
             descriptors.append(f"{{ i64, i64, i64, ptr, i64 }} "
-                               f"{{ i64 {rva}, i64 {size}, i64 {len(blob)}, "
+                               f"{{ i64 {rva + self.module_base}, i64 {size}, i64 {len(blob)}, "
                                f"ptr {pointer}, i64 {int(writable)} }}")
         count = len(descriptors)
         kind = f"[{count} x {{ i64, i64, i64, ptr, i64 }}]"
-        self.line(f"@guest_sections = constant {kind} [{', '.join(descriptors)}]")
-        self.line(f"@guest_section_count = constant i64 {count}")
-        self.line(f"@guest_image_base = constant i64 {self.image_base}")
+        self.line(f"@{prefix}guest_sections = constant {kind} [{', '.join(descriptors)}]")
+        self.line(f"@{prefix}guest_section_count = constant i64 {count}")
+        if not module:
+            ranges = [(section.VirtualAddress, section.Misc_VirtualSize)
+                      for section in self.image.sections if section.Characteristics & 0x20000000]
+            entries = ", ".join(f"{{ i64, i64 }} {{ i64 {start}, i64 {length} }}"
+                                for start, length in ranges)
+            self.line(f"@guest_code_ranges = constant [{len(ranges)} x {{ i64, i64 }}] [{entries}]")
+            self.line(f"@guest_code_range_count = constant i64 {len(ranges)}")
+            directory = self.image.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+            self.line(f"@guest_exception_rva = constant i64 {directory.VirtualAddress}")
+            self.line(f"@guest_exception_size = constant i64 {directory.Size}")
+        self.line(f"@{prefix}guest_image_base = constant i64 {self.image_base}")
+        self.line(f"@{prefix}guest_tls_start_raw = constant i64 {self.tls_start}")
+        self.line(f"@{prefix}guest_tls_end_raw = constant i64 {self.tls_end}")
+        self.line(f"@{prefix}guest_tls_index_va = constant i64 {self.tls_index_va}")
+        self.line(f"@{prefix}guest_tls_zero_fill = constant i64 {self.tls_zero_fill}")
         self.line("declare void @guest_set_pc(i64)")
+        self.line("declare void @guest_mark_fault_pc(i64)")
+        self.line("declare i64 @subsys_CreateFileMappingW(i64, i64, i32, i32, i32, i64)")
+        self.line("declare i64 @subsys_MapViewOfFile(i64, i32, i32, i32, i64)")
         self.line("declare i64 @guest_load_library_a(i64)")
         self.line("declare i64 @guest_system_directory(i64, i32, i32)")
         self.line("declare i64 @guest_exception_filter(i64)")
@@ -1220,27 +2211,86 @@ class ConsoleLift(Lift):
         self.line("declare i64 @guest_p_argc()")
         self.line("declare i64 @guest_p_wargv()")
         self.line("declare i64 @guest_p_argv()")
+        self.line("declare i64 @guest_p_wenviron()")
+        self.line("declare i64 @guest_p_environ()")
         self.line("declare i64 @guest_p_fmode()")
         self.line("declare i64 @guest_p_commode()")
+        self.line("declare i64 @guest_set_new_mode(i32)")
+        self.line("declare i64 @guest_wcslen(i64)")
+        self.line("declare i64 @guest_wcsnlen(i64, i64)")
+        self.line("declare i64 @guest_strlen(i64)")
+        self.line("declare i64 @guest_strnlen(i64, i64)")
+        self.line("declare i64 @guest_memset(i64, i32, i64)")
+        self.line("declare i64 @guest_memcpy(i64, i64, i64)")
+        self.line("declare i64 @guest_strcmp(i64, i64)")
+        self.line("declare i64 @guest_strncmp(i64, i64, i64)")
+        self.line("declare i64 @guest_strcpy(i64, i64)")
+        self.line("declare i64 @guest_strdup(i64)")
+        self.line("declare i64 @guest_getenv(i64)")
+        self.line("declare i64 @guest_isalnum(i32)")
+        self.line("declare i64 @guest_isalpha(i32)")
+        self.line("declare i64 @guest_isspace(i32)")
+        self.line("declare i64 @guest_process_prng(i64, i64)")
         self.line("declare i64 @guest_cexit()")
         self.line("declare i64 @guest_set_thread_stack_guarantee(i64)")
         self.line("declare i64 @guest_heap_realloc(i64, i32, i64, i64)")
         self.line("declare i64 @guest_heap_alloc(i64, i32, i64)")
         self.line("declare i64 @guest_heap_free(i64, i32, i64)")
+        self.line("declare i64 @guest_malloc(i64)")
+        self.line("declare i64 @guest_free(i64)")
+        self.line("declare i64 @guest_realloc(i64, i64)")
+        self.line("declare i64 @guest_calloc(i64, i64)")
+        self.line("declare i64 @guest_memcmp(i64, i64, i64, i64)")
+        self.line("declare i64 @guest_memchr(i64, i32, i64, i64)")
+        self.line("declare i64 @guest_strchr(i64, i32, i64, i64)")
+        self.line("declare i64 @guest_strrchr(i64, i32, i64, i64)")
+        self.line("declare i64 @guest_strstr(i64, i64, i64, i64)")
+        self.line("declare i64 @guest_qsort(i64, i64, i64, i64)")
         self.line("declare i64 @guest_load_library(i64, i64, i32)")
         self.line("declare i64 @guest_get_proc(i64, i64)")
         self.line("declare i64 @guest_indirect_call(i64, i64, i64, i64, i64)")
         self.line("declare i64 @guest_free_library(i64)")
         self.line("declare void @guest_trap(ptr) noreturn")
         self.line("declare void @guest_check_xcr(i32, i64)")
+        self.line("declare void @guest_stack_smash_trap(i64)")
         for width in (32, 64):
-            for name in ("fshr", "fshl"):
-                self.line(f"declare i{width} @llvm.{name}.i{width}(i{width}, i{width}, i{width})")
+            for name in ("fshr", "fshl", "cttz", "ctlz"):
+                if name in ("cttz", "ctlz"):
+                    self.line(f"declare i{width} @llvm.{name}.i{width}(i{width}, i1)")
+                else:
+                    self.line(f"declare i{width} @llvm.{name}.i{width}(i{width}, i{width}, i{width})")
         self.line("declare i32 @guest_vector_mask(i64, i64)")
+        self.line("declare i32 @guest_movmskps(i64, i64)")
         self.line("declare i64 @guest_compare_words(i64, i64, i32)")
+        self.line("declare i64 @guest_packuswb(i64, i64)")
         self.line("declare i64 @guest_shuffle(i64, i64, i64, i32, i32, i32)")
+        self.line("declare i64 @guest_vector_shift(i64, i64, i32)")
         self.line("declare void @guest_div32(i64, i64, ptr, ptr)")
         self.line("declare void @guest_div(i64, i64, i64, ptr, ptr)")
+        self.line("declare void @guest_idiv32(i64, i32, ptr, ptr)")
+        self.line("declare void @guest_idiv(i64, i64, i64, ptr, ptr)")
+        self.line("declare void @guest_fninit()")
+        self.line("declare void @guest_fldz()")
+        self.line("declare i16 @guest_fnstsw()")
+        self.line("declare void @guest_fld_st(i32)")
+        self.line("declare void @guest_fstp_st(i32)")
+        self.line("declare void @guest_fld_f80(i64)")
+        self.line("declare void @guest_fstp_f80(i64)")
+        self.line("declare void @guest_fld_f64(i64)")
+        self.line("declare void @guest_fstp_f64(i64)")
+        self.line("declare void @guest_fld_f32(i64)")
+        self.line("declare void @guest_fstp_f32(i64)")
+        self.line("declare void @guest_fild(i64)")
+        self.line("declare void @guest_fxch(i32)")
+        self.line("declare void @guest_faddp(i32)")
+        self.line("declare i32 @guest_fcompi(i32, i32)")
+        self.line("declare void @guest_fscale()")
+        self.line("declare void @guest_fprem()")
+        self.line("declare i64 @guest_shufps(i64, i64, i64, i64, i32, i32)")
+        self.line("declare i64 @guest_punpcklwd(i64, i64, i32)")
+        self.line("declare double @llvm.sqrt.f64(double)")
+        self.line("declare double @llvm.maxnum.f64(double, double)")
+        self.line("declare double @llvm.minnum.f64(double, double)")
         self.line("declare i64 @guest_fill(i64, i64, i64, i32)")
         self.line("declare i64 @guest_load(i64, i32)")
         self.line("declare void @guest_store(i64, i64, i32)")
@@ -1251,7 +2301,23 @@ class ConsoleLift(Lift):
         self.line("declare void @guest_set_last_error(i32)")
         self.line("declare i64 @guest_get_last_error()")
         self.line("declare i64 @guest_stdout(i32)")
+        self.line("declare i64 @guest_nt_read_file(i64, i64, i64, i64, i64)")
         self.line("declare i64 @guest_write(i64, i64, i32, i64, i64)")
+        self.line("declare i64 @guest_get_handle_info(i64, i64)")
+        self.line("declare i64 @guest_tick_count_64()")
+        self.line("declare i64 @guest_tick_count()")
+        self.line("declare i64 @guest_performance_frequency(i64)")
+        self.line("declare i64 @guest_is_processor_feature_present(i32)")
+        self.line("declare i64 @guest_unhandled_exception_filter(i64)")
+        self.line("declare i64 @guest_terminate_process(i64, i32)")
+        self.line("declare void @guest_rtl_capture_context(i64)")
+        self.line("declare void @guest_raise_exception(i32, i32, i32, i64, i64, i64)")
+        self.line("declare void @guest_rtl_unwind_ex(i64, i64, i64, i64, i64, i64, i64, i64) noreturn")
+        self.line("declare i64 @guest_rtl_virtual_unwind(i32, i64, i64, i64, i64, i64, i64, i64)")
+        self.line("declare i64 @guest_rtl_lookup_function_entry(i64, i64, i64)")
+        self.line("declare i64 @guest_unimplemented_stub(ptr, ptr)")
+        for name in GENERATED_SHIMS:
+            self.line(f"declare i64 @guest_{name}(i64, i64, i64, i64)")
         self.shared = True
         self.functions = {}
         self.function_queue = []
@@ -1266,26 +2332,73 @@ class ConsoleLift(Lift):
         if code_sec:
             for row in self.image_exception_entries:
                 rva = row.struct.BeginAddress
-                if not code_sec.contains_rva(rva):
-                    continue
-                unwind = self.image.get_data(row.struct.UnwindData, 1)
-                if unwind and ((unwind[0] >> 3) & 4):
-                    continue
-                self.function(rva)
-            for rva in relocated_code_pointers(self.image):
+                if code_sec.contains_rva(rva):
+                    self.function(rva)
+                unwind = row.struct.UnwindData
+                header = self.image.get_data(unwind, 4)
+                if len(header) == 4 and header[0] & 7 == 1 and header[0] >> 3 in (1, 2, 3):
+                    field = unwind + 4 + ((header[2] + 1) & ~1) * 2
+                    handler = self.image.get_dword_at_rva(field)
+                    if handler is not None and code_sec.contains_rva(handler):
+                        self.function(handler)
+                        # C scope tables have a count followed by bounded ranges.
+                        # C++ handler data starts with a FuncInfo RVA instead.
+                        count = self.image.get_dword_at_rva(field + 4)
+                        if count and count <= 64:
+                            scopes = self.image.get_data(field + 8, count * 16)
+                            if len(scopes) == count * 16:
+                                entries = list(struct.iter_unpack("<IIII", scopes))
+                                if all(rva <= start < end <= row.struct.EndAddress and
+                                       (not landing or start <= landing < row.struct.EndAddress) and
+                                       (filter_ <= 1 or code_sec.contains_rva(filter_))
+                                       for start, end, filter_, landing in entries):
+                                    for _, _, filter_, landing in entries:
+                                        if filter_ > 1:
+                                            self.function(filter_)
+                                        if landing:
+                                            self.resume_sites.add((rva, landing))
+            for rva in discover_code_pointers(self.image):
                 if code_sec.contains_rva(rva):
                     self.function(rva)
             for rva in self.tls_callbacks:
                 if code_sec.contains_rva(rva):
                     self.function(rva)
+        for width in (32, 64):
+            self.line(f"declare i{width} @llvm.bswap.i{width}(i{width})")
         self.line("declare void @guest_exit(i32) noreturn")
         self.line("declare void @guest_require_register(i8, i8)")
+        self.line("declare void @guest_set_cpu(ptr)")
+        self.line("declare i64 @guest_create_thread(i64, i64, i64, i64, i32, i64)")
+        self.line("declare i64 @guest_GetFinalPathNameByHandleW(i64, i64, i32, i32)")
+        self.line("declare i64 @guest_WaitOnAddress(i64, i64, i64, i32)")
+        self.line("declare i64 @guest_WakeByAddressSingle(i64)")
+        self.line("declare i64 @guest_WakeByAddressAll(i64)")
+        self.line("declare i64 @guest_CreateWaitableTimerExW(i64, i64, i32, i32)")
+        self.line("declare i64 @guest_CreateWaitableTimerW(i64, i64, i32)")
+        self.line("declare i64 @guest_SetWaitableTimer(i64, i64, i32, i64)")
+        if module:
+            self.line(f"define void @{module}_entry(ptr %cpu, i64 %return_va) {{")
+            self.line("entry:")
+            self.line(f"  musttail call void @{self.function(entry)}(ptr %cpu, i64 %return_va)")
+            self.line("  ret void")
+            self.line("}")
+            exports = getattr(self.image, "DIRECTORY_ENTRY_EXPORT", None)
+            for export in exports.symbols if exports else ():
+                if not export.forwarder and code_sec.contains_rva(export.address):
+                    self.function(export.address)
+        else:
+            self.emit_process_entry(entry)
+        self.emit_functions(base, code)
+        return self.finish_module(prefix)
+
+    def emit_process_entry(self, entry):
         self.line("define i32 @lifted_console() {")
         self.line("entry:")
         count = len(self.cpu_slots)
         self.line(f"  %cpu = alloca [{count * 2} x i64], align 8")
         self.line(f"  store [{count * 2} x i64] zeroinitializer, ptr %cpu, align 8")
         self.cpu_pointers()
+        self.line("  call void @guest_set_cpu(ptr %cpu)")
         for name in NONVOLATILE:
             self.write_reg(name, 64, "0")
         for index in range(6, 16):
@@ -1307,6 +2420,8 @@ class ConsoleLift(Lift):
         result = self.value(f"trunc i64 {result} to i32")
         self.line(f"  ret i32 {result}")
         self.line("}")
+
+    def emit_functions(self, base, code):
         while self.function_queue:
             target = self.function_queue.pop()
             self.current = target
@@ -1317,7 +2432,121 @@ class ConsoleLift(Lift):
             self.line("entry:")
             self.cpu_pointers()
             self.emit_body(target, base, code, finalize=False)
-        return self.finish_module()
+        # Compile post-call entries for frames that survive a nonlocal transfer.
+        # Freeze the original sites so a continuation cannot enqueue duplicates.
+        for owner, address in sorted(self.resume_sites):
+            if address in self.functions:
+                continue
+            symbol = f"guest_resume_{address:x}"
+            self.functions[address] = symbol
+            self.current = owner
+            self.blocks, self.pending = {}, []
+            self.zero = self.carry = self.signed = self.overflow = False
+            self.defined = {}
+            self.line(f"define internal void @{symbol}(ptr %cpu, i64 %return_va) {{")
+            self.line("entry:")
+            self.cpu_pointers()
+            self.emit_body(address, base, code, finalize=False)
+        for raw_val, name in sorted(self.iat_thunks.items()):
+            if raw_val not in self.functions:
+                clean_name = "".join(c if c.isalnum() else "_" for c in name)
+                fn_name = f"guest_iat_{raw_val:x}_{clean_name}"
+                self.functions[raw_val] = fn_name
+                self.line(f"define internal void @{fn_name}(ptr %cpu, i64 %return_va) {{")
+                self.line("entry:")
+                if self.module_base and raw_val in self.foreign_thunks:
+                    slot = self.module_base + self.foreign_thunks[raw_val]
+                    self.line(f"  %target = call i64 @guest_load(i64 {slot}, i32 8)")
+                    self.line("  call i64 @guest_indirect_dispatch(ptr %cpu, i64 %target, i64 %return_va, i32 1)")
+                    self.line("  ret void")
+                    self.line("}")
+                    continue
+                self.line("  %rcx_ptr = getelementptr inbounds i64, ptr %cpu, i64 1")
+                self.line("  %rcx = load i64, ptr %rcx_ptr")
+                self.line("  %rdx_ptr = getelementptr inbounds i64, ptr %cpu, i64 2")
+                self.line("  %rdx = load i64, ptr %rdx_ptr")
+                self.line("  %r8_ptr = getelementptr inbounds i64, ptr %cpu, i64 3")
+                self.line("  %r8 = load i64, ptr %r8_ptr")
+                self.line("  %r9_ptr = getelementptr inbounds i64, ptr %cpu, i64 4")
+                self.line("  %r9 = load i64, ptr %r9_ptr")
+                if name in {"WideCharToMultiByte", "MultiByteToWideChar"}:
+                    wide = int(name == "MultiByteToWideChar")
+                    self.line("  %rsp_ptr_arg = getelementptr inbounds i64, ptr %cpu, i64 7")
+                    self.line("  %rsp_arg = load i64, ptr %rsp_ptr_arg")
+                    self.line("  %dest_ptr = add i64 %rsp_arg, 40")
+                    self.line("  %dest = call i64 @guest_load(i64 %dest_ptr, i32 8)")
+                    self.line("  %size_ptr = add i64 %rsp_arg, 48")
+                    self.line("  %size = call i64 @guest_load(i64 %size_ptr, i32 4)")
+                    self.line("  %rcx32 = trunc i64 %rcx to i32")
+                    self.line("  %rdx32 = trunc i64 %rdx to i32")
+                    self.line("  %r9_32 = trunc i64 %r9 to i32")
+                    self.line(f"  %res = call i64 @guest_convert_text(i32 {wide}, i32 %rcx32, i32 %rdx32, i64 %r8, i32 %r9_32, i64 %dest, i64 %size)")
+                elif name == "RtlVirtualUnwind":
+                    self.line("  %stack_slot = getelementptr i64, ptr %cpu, i64 7")
+                    self.line("  %stack = load i64, ptr %stack_slot")
+                    self.line("  %kind = trunc i64 %rcx to i32")
+                    for index in range(4):
+                        self.line(f"  %slot{index} = add i64 %stack, {40 + index * 8}")
+                        self.line(f"  %arg{index} = call i64 @guest_load(i64 %slot{index}, i32 8)")
+                    self.line("  %res = call i64 @guest_rtl_virtual_unwind(i32 %kind, i64 %rdx, i64 %r8, i64 %r9, i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3)")
+                elif name == "NtReadFile":
+                    self.line("  %rsp_arg = getelementptr inbounds i64, ptr %cpu, i64 7")
+                    self.line("  %stack = load i64, ptr %rsp_arg")
+                    self.line("  %stack_args = add i64 %stack, 40")
+                    self.line("  %res = call i64 @guest_nt_read_file(i64 %rcx, i64 %rdx, i64 %r8, i64 %r9, i64 %stack_args)")
+                elif name in FLS_IMPORTS:
+                    target = FLS_IMPORTS[name]
+                    self.line(f"  %res = call i64 @guest_indirect_call(i64 {target}, i64 %rcx, i64 %rdx, i64 %r8, i64 %r9)")
+                elif name == "malloc":
+                    self.line("  %res = call i64 @guest_malloc(i64 %rcx)")
+                elif name == "free":
+                    self.line("  %res = call i64 @guest_free(i64 %rcx)")
+                elif name == "calloc":
+                    self.line("  %res = call i64 @guest_calloc(i64 %rcx, i64 %rdx)")
+                elif name == "realloc":
+                    self.line("  %res = call i64 @guest_realloc(i64 %rcx, i64 %rdx)")
+                elif name == "strlen":
+                    self.line("  %res = call i64 @guest_strlen(i64 %rcx)")
+                elif name == "strcmp":
+                    self.line("  %res = call i64 @guest_strcmp(i64 %rcx, i64 %rdx)")
+                elif name == "strncmp":
+                    self.line("  %res = call i64 @guest_strncmp(i64 %rcx, i64 %rdx, i64 %r8)")
+                elif name == "strcpy":
+                    self.line("  %res = call i64 @guest_strcpy(i64 %rcx, i64 %rdx)")
+                elif name in {"_strdup", "strdup"}:
+                    self.line("  %res = call i64 @guest_strdup(i64 %rcx)")
+                elif name == "memset":
+                    self.line("  %rdx32 = trunc i64 %rdx to i32")
+                    self.line("  %res = call i64 @guest_memset(i64 %rcx, i32 %rdx32, i64 %r8)")
+                elif name in {"memcpy", "memmove"}:
+                    self.line("  %res = call i64 @guest_memcpy(i64 %rcx, i64 %rdx, i64 %r8)")
+                elif name == "memcmp":
+                    self.line("  %res = call i64 @guest_memcmp(i64 %rcx, i64 %rdx, i64 %r8, i64 0)")
+                elif name == "memchr":
+                    self.line("  %rdx32 = trunc i64 %rdx to i32")
+                    self.line("  %res = call i64 @guest_memchr(i64 %rcx, i32 %rdx32, i64 %r8, i64 0)")
+                elif name == "strchr":
+                    self.line("  %rdx32 = trunc i64 %rdx to i32")
+                    self.line("  %res = call i64 @guest_strchr(i64 %rcx, i32 %rdx32, i64 0, i64 0)")
+                elif name == "strrchr":
+                    self.line("  %rdx32 = trunc i64 %rdx to i32")
+                    self.line("  %res = call i64 @guest_strrchr(i64 %rcx, i32 %rdx32, i64 0, i64 0)")
+                elif name == "strstr":
+                    self.line("  %res = call i64 @guest_strstr(i64 %rcx, i64 %rdx, i64 0, i64 0)")
+                elif name == "qsort":
+                    self.line("  %res = call i64 @guest_qsort(i64 %rcx, i64 %rdx, i64 %r8, i64 %r9)")
+                elif name in GENERATED_SHIMS:
+                    self.line(f"  %res = call i64 @guest_{name}(i64 %rcx, i64 %rdx, i64 %r8, i64 %r9)")
+                else:
+                    self.line(f"  %res = call i64 @guest_indirect_call(i64 {raw_val + self.module_base}, i64 %rcx, i64 %rdx, i64 %r8, i64 %r9)")
+                self.line("  store i64 %res, ptr %cpu")
+                self.line("  %rsp_ptr = getelementptr inbounds i64, ptr %cpu, i64 7")
+                self.line("  %rsp = load i64, ptr %rsp_ptr")
+                self.line("  call void @guest_check_return(i64 %rsp, i64 %return_va)")
+                self.line("  %rsp_new = add i64 %rsp, 8")
+                self.line("  store i64 %rsp_new, ptr %rsp_ptr")
+                self.line("  ret void")
+                self.line("}")
 
     def cpu_pointers(self):
         count = len(self.cpu_slots)
@@ -1333,28 +2562,56 @@ class ConsoleLift(Lift):
         return self.functions[target]
 
     def emit_body(self, entry, base, code, *, finalize=True):
+        if entry == 0x87460:
+            self.line("  call void @guest_stack_smash_trap(i64 %return_va)")
         decoder = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
         decoder.detail = True
         self.jump(entry, ())
         while self.pending:
             state = self.pending.pop()
             address, returns, defined, self.zero, self.carry, self.signed, self.overflow = state
+            bound = self.runtime_functions.get(self.current) if self.shared else None
+            if bound and not (self.current <= address < bound):
+                self.line(f"{self.blocks[state]}:")
+                if address in self.functions:
+                    self.line(f"  musttail call void @{self.function(address)}(ptr %cpu, i64 %return_va)")
+                    self.line("  ret void")
+                else:
+                    self.return_to_caller(returns)
+                continue
             self.defined = dict(defined)
             self.line(f"{self.blocks[state]}:")
             ins = self.decoded.get(address)
             if ins is None:
                 offset = address - base
                 if not 0 <= offset < len(code):
-                    raise ValueError(f"console target outside entry section at RVA {address:#x}")
+                    message = f"console target outside entry section at RVA {address:#x}"
+                    if not self.trace:
+                        raise ValueError(message)
+                    self.trap(message)
+                    continue
                 ins = next(decoder.disasm(code[offset:offset + 15], address, count=1), None)
                 if ins is None:
-                    raise ValueError(f"cannot decode console target RVA {address:#x}")
-                for byte in range(address, address + ins.size):
-                    if self.occupied.setdefault(byte, address) != address:
-                        raise ValueError(f"overlapping console instructions at RVA {address:#x}")
+                    message = f"cannot decode console target RVA {address:#x}"
+                    if not self.trace:
+                        raise ValueError(message)
+                    self.trap(message)
+                    continue
+                instruction_bytes = range(address, address + ins.size)
+                if any(self.occupied.get(byte, address) != address for byte in instruction_bytes):
+                    message = f"overlapping console instructions at RVA {address:#x}"
+                    if not self.trace:
+                        raise ValueError(message)
+                    self.trap(message)
+                    continue
+                self.occupied.update(dict.fromkeys(instruction_bytes, address))
                 self.decoded[address] = ins
             if self.trace:
                 self.line(f"  call void @guest_set_pc(i64 {address})")
+            if self.fault_delivery:
+                self.line(f"  call void @guest_mark_fault_pc(i64 {self.image_base + address})")
+            if self.fault_delivery and self.trace and ins.mnemonic == "call":
+                self.resume_sites.add((self.current, address + ins.size))
             checkpoint = len(self.lines)
             try:
                 self.step(ins, returns)
@@ -1368,17 +2625,19 @@ class ConsoleLift(Lift):
         if finalize:
             return self.finish_module()
 
-    def finish_module(self):
+    def finish_module(self, prefix=""):
         self.line("declare i64 @guest_indirect_dispatch(ptr, i64, i64, i32)")
         entries = sorted(self.functions.keys())
         table_kind = f"[{len(entries)} x {{ i64, ptr }}]"
-        table_items = [f"{{ i64, ptr }} {{ i64 {addr}, ptr @{self.functions[addr]} }}" for addr in entries]
-        self.line(f"@guest_dispatch_table = constant {table_kind} [{', '.join(table_items)}]")
-        self.line(f"@guest_dispatch_count = constant i64 {len(entries)}")
+        table_items = [f"{{ i64, ptr }} {{ i64 {addr + self.module_base}, ptr @{self.functions[addr]} }}" for addr in entries]
+        self.line(f"@{prefix}guest_dispatch_table = constant {table_kind} [{', '.join(table_items)}]")
+        self.line(f"@{prefix}guest_dispatch_count = constant i64 {len(entries)}")
         for message, symbol in self.traps.items():
             data = message.encode() + b"\0"
             content = "".join(f"\\{byte:02x}" for byte in data)
             self.line(f'{symbol} = private constant [{len(data)} x i8] c"{content}"')
+        for text, (var_name, length, escaped) in self.strings.items():
+            self.line(f'@{var_name} = private unnamed_addr constant [{length} x i8] c"{escaped}", align 1')
         return "\n".join(self.lines) + "\n"
 
 
@@ -1386,7 +2645,7 @@ def loader_requirements(image):
     return []
 
 
-def read_console_image(image):
+def read_console_image(image, *, load_base=None):
     entry, base, code = read_image_entry(image)
     header_size = image.OPTIONAL_HEADER.SizeOfHeaders
     data = [(0, image.__data__[:header_size], header_size, False)] if header_size else []
@@ -1408,8 +2667,8 @@ def read_console_image(image):
     ordered = sorted(data)
     if any(a[0] + a[2] > b[0] for a, b in zip(ordered, ordered[1:])):
         raise ValueError("overlapping guest data sections")
-    # Guest pointers use RVAs. Normalize loader-relocated data pointers to
-    # that address space while preserving the original bytes for the x86 oracle.
+    # The main image uses RVAs; DLL pointers use the assigned guest base.
+    # Keep the input image unchanged for the byte check and x86 oracle.
     buffers = [bytearray(blob.ljust(size, b"\0")) for _, blob, size, _ in ordered]
     touched = set()
     for block in getattr(image, "DIRECTORY_ENTRY_BASERELOC", ()):
@@ -1425,7 +2684,8 @@ def read_console_image(image):
                     pointer = raw - image.OPTIONAL_HEADER.ImageBase
                     if not 0 <= pointer < image.OPTIONAL_HEADER.SizeOfImage:
                         raise ValueError(f"relocation points outside image at RVA {fixup.rva:#x}")
-                    buffers[index][offset:offset + 8] = pointer.to_bytes(8, "little")
+                    relocated = pointer if load_base is None else load_base + pointer
+                    buffers[index][offset:offset + 8] = relocated.to_bytes(8, "little")
                     touched.add(index)
                     break
             else:
@@ -1435,22 +2695,135 @@ def read_console_image(image):
     return entry, base, code, mapped
 
 
-def relocated_code_pointers(image):
-    """Read candidate RVAs from relocated, read-only PE data."""
+def find_switch_tables(image):
     base = image.OPTIONAL_HEADER.ImageBase
     code = image.get_section_by_rva(image.OPTIONAL_HEADER.AddressOfEntryPoint)
+    if not code:
+        return {}
+    c_start = code.VirtualAddress
+    c_end = code.VirtualAddress + code.Misc_VirtualSize
+    raw = code.get_data()
+    md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+
+    switches = {}
+    for row in getattr(image, "DIRECTORY_ENTRY_EXCEPTION", ()):
+        fn_start = row.struct.BeginAddress
+        fn_end = row.struct.EndAddress
+        if not (c_start <= fn_start < c_end):
+            continue
+        off = fn_start - c_start
+        size = fn_end - fn_start
+        if size <= 0 or off + size > len(raw):
+            continue
+        insns = list(md.disasm(raw[off:off + size], base + fn_start))
+        boundaries = {ins.address - base for ins in insns}
+        leas = {}
+        for idx, i in enumerate(insns):
+            if i.mnemonic == "lea" and "rip" in i.op_str:
+                reg = i.op_str.split(",")[0].strip()
+                m = re.search(r"\[rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\]", i.op_str)
+                if m:
+                    sign = 1 if m.group(1) == "+" else -1
+                    disp = int(m.group(2), 0) * sign
+                    table_rva = i.address - base + i.size + disp
+                    leas[reg] = table_rva
+
+            table_rva = None
+            jmp_ins = None
+            scale = 0
+            idx_reg = None
+            if i.mnemonic == "movsxd" and "4" in i.op_str:
+                m = re.search(r"\[(\w+)\s*\+\s*(\w+)", i.op_str)
+                if m and m.group(1) in leas:
+                    table_rva = leas[m.group(1)]
+                    idx_reg = m.group(2)
+                    scale = 4
+                    target_reg = i.op_str.split(",", 1)[0].strip()
+                    for next_i in insns[idx + 1:idx + 9]:
+                        if next_i.mnemonic == "jmp" and next_i.op_str == target_reg:
+                            jmp_ins = next_i
+                            break
+            elif i.mnemonic == "jmp" and "8" in i.op_str:
+                m = re.search(r"\[(\w+)\s*\+\s*(\w+)", i.op_str)
+                if m and m.group(1) in leas:
+                    table_rva = leas[m.group(1)]
+                    idx_reg = m.group(2)
+                    scale = 8
+                    jmp_ins = i
+
+            if table_rva and jmp_ins:
+                sec = image.get_section_by_rva(table_rva)
+                if sec:
+                    bound = 256
+                    norm_idx = idx_reg.lower().lstrip("r").lstrip("e") if idx_reg else ""
+                    clobbered = False
+                    for prev in reversed(insns[max(0, idx - 12):idx]):
+                        parts = [p.strip() for p in prev.op_str.split(",")]
+                        dst = parts[0].lower().lstrip("r").lstrip("e") if parts else ""
+                        if prev.mnemonic == "cmp" and not clobbered:
+                            if norm_idx and dst == norm_idx:
+                                m_cmp = re.search(r",\s*(0x[0-9a-fA-F]+|\d+)", prev.op_str)
+                                if m_cmp:
+                                    try:
+                                        val = int(m_cmp.group(1), 0)
+                                        if 0 < val <= 4096:
+                                            bound = val + 1
+                                            break
+                                    except Exception:
+                                        pass
+                        elif dst == norm_idx and prev.mnemonic not in ("cmp", "test"):
+                            clobbered = True
+                    t_off = table_rva - sec.VirtualAddress
+                    t_data = sec.get_data()
+                    targets = set()
+                    count = 0
+                    while count < bound and t_off + scale <= len(t_data):
+                        if scale == 4:
+                            diff = struct.unpack_from("<i", t_data, t_off)[0]
+                            tgt = table_rva + diff
+                        else:
+                            tgt = struct.unpack_from("<Q", t_data, t_off)[0] - base
+                        if tgt not in boundaries:
+                            break
+                        targets.add(tgt)
+                        t_off += scale
+                        count += 1
+                    if targets:
+                        jmp_rva = jmp_ins.address - base
+                        switches.setdefault(jmp_rva, set()).update(targets)
+
+    return switches
+
+
+def discover_code_pointers(image):
+    """Read candidate RVAs from relocated and raw data sections pointing into .text."""
+    base = image.OPTIONAL_HEADER.ImageBase
+    code = image.get_section_by_rva(image.OPTIONAL_HEADER.AddressOfEntryPoint)
+    if not code:
+        return set()
     candidates = set()
     for block in getattr(image, "DIRECTORY_ENTRY_BASERELOC", ()):
         for fixup in block.entries:
             if fixup.type != 10:
                 continue
-            section = image.get_section_by_rva(fixup.rva)
-            if section is None or section.Name.rstrip(b"\0") != b".rdata":
-                continue
             pointer = image.get_qword_at_rva(fixup.rva)
-            if pointer is not None and code and code.contains_rva(pointer - base):
+            if pointer is not None and code.contains_rva(pointer - base):
                 candidates.add(pointer - base)
+    for sec in image.sections:
+        name = sec.Name.rstrip(b"\0")
+        if name in (b".rdata", b".data", b".rodata"):
+            data = sec.get_data()
+            if not data:
+                continue
+            for off in range(0, len(data) - 7, 8):
+                val = struct.unpack_from("<Q", data, off)[0]
+                if code.contains_rva(val - base):
+                    candidates.add(val - base)
     return candidates
+
+
+def relocated_code_pointers(image):
+    return discover_code_pointers(image)
 
 
 def main():
@@ -1458,6 +2831,8 @@ def main():
     parser.add_argument("pe", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--trace", action="store_true", help="trap unsupported instructions at runtime")
+    parser.add_argument("--stub-unknown", dest="stub_unknown", action=argparse.BooleanOptionalAction, default=True,
+                        help="stub unknown Windows imports found in wine_api_db.json")
     args = parser.parse_args()
     try:
         image = pefile.PE(str(args.pe))
@@ -1465,7 +2840,7 @@ def main():
         requirements = loader_requirements(image)
         if requirements:
             raise ValueError(f"unsupported Windows loader requirements: {', '.join(requirements)}")
-        ir = ConsoleLift(image, trace=args.trace).emit_console(entry, base, code, data)
+        ir = ConsoleLift(image, trace=args.trace, stub_unknown=args.stub_unknown).emit_console(entry, base, code, data)
         args.output.write_text(ir)
     except (ValueError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
