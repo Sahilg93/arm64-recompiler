@@ -163,6 +163,9 @@ export PYTHON="$python"
 # Darwin SIGSEGV/SIGBUS delivery for raw VirtualAlloc faults to VEH and table-driven SEH.
 fixtures/vm_fault/test.sh
 
+# Runtime-generated code: interpreted PAGE_EXECUTE* buffers, RWX patching, DEP faults.
+fixtures/jit/test.sh
+
 # MSVC C++ EH and __try/__except, compared with Wine. Needs clang-cl and an xwin SDK.
 if [[ -z "${XWIN_SDK:-}" && -d "$repository/work/xwin-sdk/crt" ]]; then
     export XWIN_SDK="$repository/work/xwin-sdk"

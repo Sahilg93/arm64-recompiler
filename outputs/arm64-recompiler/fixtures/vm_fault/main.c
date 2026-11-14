@@ -37,6 +37,7 @@ IMPORT BOOL WINAPI VirtualFree(void *, size_t, DWORD);
 IMPORT BOOL WINAPI VirtualProtect(void *, size_t, DWORD, DWORD *);
 
 int seh_read(volatile int *);
+int seh_resume(void);
 
 static volatile unsigned char *region;
 static volatile unsigned step;
@@ -59,7 +60,6 @@ static int is_violation(const struct exception_record *record, ULONG_PTR writing
            record->arguments[0] == writing && record->arguments[1] == address;
 }
 
-static void after_seh_read(void);
 static void after_read_only_write(void);
 static void after_no_access_read(void);
 
@@ -79,7 +79,10 @@ int seh_handler(struct exception_record *record, ULONG_PTR frame, unsigned char 
     if (step != 3 || !frame || !dispatcher || !is_violation(record, 0, (ULONG_PTR)(region + 0xc0)))
         return 1; /* ExceptionContinueSearch */
     ++step;
-    redirect(context, after_seh_read);
+    /* Pop seh_read's 40-byte frame and finish the call in seh_resume, which
+       returns 0x73 into the middle of after_read_only_write. */
+    *context_slot(context, 0x98) += 40;
+    *context_slot(context, 0xf8) = (ULONG_PTR)seh_resume;
     return 0; /* ExceptionContinueExecution */
 }
 
@@ -95,16 +98,10 @@ static void finish(void) {
 }
 
 /*
- * Continuations never return: the launcher resumes a redirected guest at a
- * function entry, and returning into the middle of the interrupted function
- * would leave lifted code.
+ * The vectored continuations below never return. The table-driven case does:
+ * seh_resume returns into the middle of after_read_only_write, which the
+ * launcher runs in its x86 interpreter because no compiled entry starts there.
  */
-static void after_seh_read(void) {
-    if (step != 4)
-        ExitProcess(34);
-    finish();
-}
-
 static void after_read_only_write(void) {
     DWORD old = 0;
     if (step != 3 || region[0x40] != 0x5a || region[0x80] != 0)
@@ -113,8 +110,9 @@ static void after_read_only_write(void) {
         ExitProcess(31);
     if (!VirtualProtect((void *)region, REGION_SIZE, PAGE_NOACCESS, &old) || old != PAGE_READONLY)
         ExitProcess(32);
-    seh_read((volatile int *)(region + 0xc0));
-    ExitProcess(33);
+    if (seh_read((volatile int *)(region + 0xc0)) != 0x73 || step != 4)
+        ExitProcess(33);
+    finish();
 }
 
 static void after_no_access_read(void) {

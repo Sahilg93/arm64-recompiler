@@ -24,7 +24,10 @@ The fixture checks, in order:
    reaches the vectored handler with a write flag, and the store has no effect.
 4. With the vectored handler removed and the page `PAGE_NOACCESS`, a read
    inside `seh_read` (`seh.s`) reaches its table-driven handler through
-   `.pdata`/`.xdata`.
+   `.pdata`/`.xdata`. The handler pops `seh_read`'s frame and resumes at
+   `seh_resume`, which returns into the middle of the C caller. No compiled
+   entry starts there, so the launcher finishes that function in its x86
+   interpreter.
 5. `VirtualProtect` reports `PAGE_NOACCESS` as the old value, the data written
    in step 2 is intact, and `VirtualFree(MEM_RELEASE)` succeeds.
 
@@ -32,5 +35,4 @@ Exit status 0 means every step passed. Each failure has its own status.
 Running with `ARM64_RECOMPILER_FAULT_SIGNALS=0` disables delivery, and the
 first fault then terminates the process with `SIGBUS`.
 
-Handlers resume at continuation functions that never return, because the
-launcher resumes a redirected guest at a function entry.
+The vectored handlers resume at continuation functions that never return.

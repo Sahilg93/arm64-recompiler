@@ -3561,6 +3561,24 @@ static inline __attribute__((always_inline)) void (*guest_lookup_dispatch(uint64
 
 #include "x86_interpret.h"
 
+static void dispatch_guest_exception(uint32_t, uint32_t, uint32_t, const uint64_t *,
+                                     uint64_t, uint64_t, bool);
+bool subsys_vm_tracked(uint64_t);
+
+/*
+ * Control reached a VirtualAlloc page that is not PAGE_EXECUTE*: report the
+ * access violation Windows raises under DEP (ExceptionInformation[0] = 8),
+ * with Rip at the target and the return address on top of the stack.
+ */
+static __attribute__((noreturn)) void guest_execute_violation(uint64_t *regs, uint64_t target) {
+    uint64_t arguments[] = {8, target};
+    current_cpu = regs;
+    delivering_fault = true;
+    dispatch_guest_exception(0xc0000005, 0, 2, arguments, target, regs[7], true);
+    guest_trap("execute access violation did not transfer control");
+    __builtin_unreachable();
+}
+
 __attribute__((always_inline)) uint64_t guest_indirect_dispatch(void *cpu, uint64_t target, uint64_t return_va, uint32_t tail) {
     current_cpu = cpu;
     if (guest_image_base && target >= guest_image_base && target - guest_image_base < 0x20000000)
@@ -3571,8 +3589,10 @@ __attribute__((always_inline)) uint64_t guest_indirect_dispatch(void *cpu, uint6
         fn(cpu, return_va);
         return regs[0];
     }
-    if (guest_code_contains(target, 1))
+    if (guest_code_contains(target, 1) || subsys_vm_executable(target, 1))
         return x86_interpret(regs, target, return_va);
+    if (subsys_vm_tracked(target))
+        guest_execute_violation(regs, target);
     uint64_t rcx = regs[1], rdx = regs[2], r8 = regs[3], r9 = regs[4];
     uint64_t result = guest_indirect_call(target, rcx, rdx, r8, r9);
     regs[0] = result;

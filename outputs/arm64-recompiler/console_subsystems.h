@@ -819,14 +819,17 @@ static struct VmRegion g_vm_regions[MAX_VM_REGIONS];
 static size_t g_vm_region_count;
 static pthread_mutex_t g_vm_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Host protection for a Windows page protection. Guest x86 code is never run
+ * by the host CPU (the interpreter reads it), so PAGE_EXECUTE* maps to plain
+ * read/write host pages; that also avoids macOS refusing RWX mappings without
+ * MAP_JIT. Execute permission is tracked per page in g_vm_protect.
+ */
 static int subsys_win32_prot(uint32_t protect) {
     switch (protect & 0xff) {
     case 0x01: return PROT_NONE;
-    case 0x02: return PROT_READ;
-    case 0x04: case 0x08: return PROT_READ | PROT_WRITE;
-    case 0x10: return PROT_READ | PROT_EXEC;
-    case 0x20: return PROT_READ | PROT_EXEC;
-    case 0x40: case 0x80: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case 0x02: case 0x10: case 0x20: return PROT_READ;
+    case 0x04: case 0x08: case 0x40: case 0x80: return PROT_READ | PROT_WRITE;
     default: return -1;
     }
 }
@@ -889,6 +892,54 @@ static bool subsys_vm_set_protect(uintptr_t start, uintptr_t end, uint32_t prote
     return true;
 }
 
+/*
+ * True when [addr, addr + size) lies in a tracked VirtualAlloc region whose
+ * pages are all committed with a PAGE_EXECUTE* protection.
+ */
+bool subsys_vm_executable(uint64_t addr, uint64_t size) {
+    size_t page_size = subsys_page_size();
+    if (!size)
+        size = 1;
+    pthread_mutex_lock(&g_vm_lock);
+    bool executable = subsys_vm_region((uintptr_t)addr, (size_t)size) != NULL;
+    for (uintptr_t page = (uintptr_t)addr & ~(page_size - 1);
+         executable && page < (uintptr_t)addr + size; page += page_size)
+        executable = (subsys_vm_get_protect(page) & 0xf0) != 0;
+    pthread_mutex_unlock(&g_vm_lock);
+    return executable;
+}
+
+/* True when addr lies in any tracked VirtualAlloc region. */
+bool subsys_vm_tracked(uint64_t addr) {
+    pthread_mutex_lock(&g_vm_lock);
+    bool tracked = subsys_vm_region((uintptr_t)addr, 1) != NULL;
+    pthread_mutex_unlock(&g_vm_lock);
+    return tracked;
+}
+
+/*
+ * The runtime reads any address in [image base, image base + 512 MiB) as an
+ * image address, so host mappings handed to the guest must stay outside it.
+ */
+static bool subsys_in_image_window(uintptr_t address, size_t size) {
+    uint64_t low = guest_image_base, high = guest_image_base + 0x20000000;
+    return guest_image_base && address < high && address + size > low;
+}
+
+static void *subsys_guest_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
+    void *ptr = mmap(hint, size, prot, flags, fd, offset);
+    if (ptr == MAP_FAILED || hint || !subsys_in_image_window((uintptr_t)ptr, size))
+        return ptr;
+    munmap(ptr, size);
+    ptr = mmap((void *)(uintptr_t)(guest_image_base + 0x20000000), size, prot, flags, fd, offset);
+    if (ptr != MAP_FAILED && subsys_in_image_window((uintptr_t)ptr, size)) {
+        munmap(ptr, size);
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return ptr;
+}
+
 unsigned char *subsys_mapping_span(uint64_t addr, uint64_t size) {
     pthread_mutex_lock(&g_vm_lock);
     bool region = subsys_vm_region((uintptr_t)addr, (size_t)size) != NULL;
@@ -947,8 +998,8 @@ uint64_t subsys_VirtualAlloc(uint64_t lpAddress, uint64_t dwSize, uint32_t flAll
     if (!lpAddress)
         sz = (dwSize + page_size - 1) & ~(page_size - 1);
     /* Never MAP_FIXED: a guest hint must not replace host mappings. */
-    void *ptr = mmap(lpAddress ? (void *)start : NULL, sz, commit ? prot : PROT_NONE,
-                     MAP_ANON | MAP_PRIVATE, -1, 0);
+    void *ptr = subsys_guest_mmap(lpAddress ? (void *)start : NULL, sz, commit ? prot : PROT_NONE,
+                                  MAP_ANON | MAP_PRIVATE, -1, 0);
     if (ptr == MAP_FAILED) {
         pthread_mutex_unlock(&g_vm_lock);
         guest_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
@@ -1100,9 +1151,9 @@ uint64_t subsys_MapViewOfFileEx(uint64_t hFileMappingObject, uint32_t dwDesiredA
 
     void *ptr;
     if (e->fd >= 0) {
-        ptr = mmap(hint, sz, prot, flags, e->fd, off);
+        ptr = subsys_guest_mmap(hint, sz, prot, flags, e->fd, off);
     } else {
-        ptr = mmap(hint, sz, prot, MAP_ANON | flags, -1, 0);
+        ptr = subsys_guest_mmap(hint, sz, prot, MAP_ANON | flags, -1, 0);
     }
 
     if (ptr == MAP_FAILED) {
