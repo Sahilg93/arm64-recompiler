@@ -26,7 +26,7 @@ This is not a general "run any Windows binary" tool.
 
 ![Plink -V running natively, then the lifted PuTTY GUI opening an SSH session](outputs/arm64-recompiler/docs/demo.gif)
 
-Full-resolution video: [16:9](outputs/arm64-recompiler/docs/demo-16x9.mp4) · [9:16](outputs/arm64-recompiler/docs/demo-9x16.mp4). The PuTTY windows are captures of the lifted program running, with the wait before the SSH window shortened. The Plink terminal is rendered from the binary's real output.
+[Full-resolution video (1080p MP4)](outputs/arm64-recompiler/docs/demo-16x9.mp4). The PuTTY windows are captures of the lifted program running, with the wait before the SSH window shortened. The Plink terminal is rendered from the binary's real output.
 
 | PuTTY configuration dialog | PuTTY SSH session |
 | --- | --- |
