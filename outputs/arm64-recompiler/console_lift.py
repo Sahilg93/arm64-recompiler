@@ -836,7 +836,9 @@ class ConsoleLift(Lift):
                   self.read_reg(name, 64) if self.defined.get(name) == 64 else "0"
                   for name in ("rcx", "rdx", "r8", "r9")]
         arguments = ", ".join(f"i64 {value}" for value in (target, *values))
-        result = self.value(f"call i64 @guest_indirect_call({arguments})")
+        # No return address is pushed here (unlike IAT thunks): stack arguments
+        # start at rsp+32. The _inline entry tells the runtime so.
+        result = self.value(f"call i64 @guest_indirect_call_inline({arguments})")
         for register in (*VOLATILE, *(f"xmm{i}" for i in range(6))):
             self.defined.pop(register, None)
             if self.shared:
@@ -1519,7 +1521,7 @@ class ConsoleLift(Lift):
                 self.line("  call void @guest_fprem()")
             self.jump(following, returns)
             return
-        if op in {"movups", "movupd", "packuswb", "pinsrw", "pextrw", "movaps", "movapd", "movdqu", "movdqa", "pxor", "xorps", "xorpd", "pand", "andps", "andpd", "por", "orps", "orpd", "pandn", "andnps", "andnpd", "punpcklqdq", "unpcklpd", "punpckhqdq", "unpckhpd", "movlhps", "movhlps", "punpckldq", "punpcklbw", "punpckhbw", "punpcklwd", "pshuflw", "pshufhw", "pshufd", "pcmpeqw", "pcmpeqb", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pmovmskb", "movmskps", "movmskpd", "paddd", "paddq", "psubd", "psubq", "movd", "movq", "movsd", "shufpd", "shufps", "psrldq", "pslldq", "psllw", "psrlw", "pslld", "psrld", "psllq", "psrlq"}:
+        if op in {"movups", "movupd", "packuswb", "pinsrw", "pextrw", "movaps", "movapd", "movdqu", "movdqa", "pxor", "xorps", "xorpd", "pand", "andps", "andpd", "por", "orps", "orpd", "pandn", "andnps", "andnpd", "punpcklqdq", "unpcklpd", "punpckhqdq", "unpckhpd", "movlhps", "movhlps", "punpckldq", "punpcklbw", "punpckhbw", "punpcklwd", "pshuflw", "pshufhw", "pshufd", "pcmpeqw", "pcmpeqb", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pmovmskb", "movmskps", "movmskpd", "paddd", "paddq", "psubd", "psubq", "movd", "movq", "movsd", "shufpd", "shufps", "psrldq", "pslldq", "psllw", "psrlw", "pslld", "psrld", "psllq", "psrlq", "movddup"}:
             dest, source = args[:2]
             def vector(operand):
                 if operand.type == x.X86_OP_REG:
@@ -1630,6 +1632,13 @@ class ConsoleLift(Lift):
                 values[lane] = self.value(f"or i64 {old}, {unit}")
             elif op in {"punpcklqdq", "unpcklpd", "movlhps"}:
                 values = (vector(dest)[0], vector(source)[0])
+            elif op == "movddup":
+                # The memory form reads only 64 bits.
+                if source.type == x.X86_OP_MEM:
+                    low = self.value(f"call i64 @guest_load(i64 {self.address(ins, source)}, i32 8)")
+                else:
+                    low = vector(source)[0]
+                values = (low, low)
             elif op in {"punpckhqdq", "unpckhpd"}:
                 values = (vector(dest)[1], vector(source)[1])
             elif op == "movhlps":
@@ -2323,6 +2332,7 @@ class ConsoleLift(Lift):
         self.line("declare i64 @guest_load_library(i64, i64, i32)")
         self.line("declare i64 @guest_get_proc(i64, i64)")
         self.line("declare i64 @guest_indirect_call(i64, i64, i64, i64, i64)")
+        self.line("declare i64 @guest_indirect_call_inline(i64, i64, i64, i64, i64)")
         self.line("declare i64 @guest_free_library(i64)")
         self.line("declare void @guest_trap(ptr) noreturn")
         self.line("declare void @guest_check_xcr(i32, i64)")

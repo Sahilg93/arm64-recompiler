@@ -938,6 +938,49 @@ static void release_application_module(struct guest_module *module) {
     release_module_dependencies(module);
 }
 
+static uint64_t nls_file(const char *name, uint64_t *size);
+static void (*guest_lookup_dispatch(uint64_t target))(void *, uint64_t);
+
+/* Call a lifted guest function with up to four arguments on a fresh frame below the caller's. */
+static uint64_t call_guest_function(uint64_t target, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    void (*fn)(void *, uint64_t) = guest_lookup_dispatch(target);
+    uint64_t *caller = current_cpu;
+    if (!fn || !caller)
+        return 0;
+    uint64_t cpu[128] = {0};
+    init_guest_cpu(cpu);
+    cpu[1] = a;
+    cpu[2] = b;
+    cpu[3] = c;
+    cpu[4] = d;
+    cpu[7] = (caller[7] & ~UINT64_C(15)) - 40;
+    guest_store(cpu[7], 0, 8);
+    current_cpu = cpu;
+    fn(cpu, 0);
+    current_cpu = caller;
+    return cpu[0];
+}
+
+/*
+ * Wine's loader initializes ntdll's NLS state (ANSI/OEM code pages and case
+ * tables) during process startup, which the runtime loader replaces. Do the
+ * same through ntdll's own exports once the lifted ntdll.dll is loaded.
+ */
+static void init_lifted_ntdll(struct guest_module *module) {
+    uint64_t size, ansi = nls_file("c_1252.nls", &size), oem = nls_file("c_437.nls", &size);
+    uint64_t casemap = nls_file("l_intl.nls", &size);
+    uint64_t init = module_export(module, "RtlInitNlsTables", 0);
+    uint64_t reset = module_export(module, "RtlResetRtlTranslations", 0);
+    if (!ansi || !oem || !casemap || !init || !reset)
+        return;
+    /* NLSTABLEINFO: two CPTABLEINFO (0x40 each) plus upper/lower case table pointers. */
+    uint64_t info = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, 0x100);
+    if (!info)
+        return;
+    call_guest_function(init, ansi, oem, casemap, info);
+    call_guest_function(reset, info, 0, 0, 0);
+}
+
 static uint64_t load_guest_module(struct guest_module *module, const char *path) {
     FILE *file = fopen(path, "rb");
     if (!file) {
@@ -1009,6 +1052,8 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
             memcpy(slot, &target, sizeof target);
         }
     }
+    if (!strcasecmp(module->name, "ntdll.dll") && is_lifted_system_dll("ntdll.dll"))
+        init_lifted_ntdll(module);
     if (!call_module_entry(module, 1)) {
         last_error = 1114;
         goto fail;
@@ -3537,8 +3582,75 @@ static uint64_t call_service(size_t index, uint64_t first, uint64_t second,
     return 87;
 }
 
+/*
+ * kernel32 (or other system) functions the runtime does not implement fall
+ * back to the lifted kernelbase.dll when the program ships one: the export
+ * runs as lifted Wine code in the caller's own guest frame, so register and
+ * stack arguments are exactly as the caller placed them.
+ */
+/*
+ * Set by guest_indirect_call_inline (lifted inline import calls, where no
+ * return address is pushed) and consumed at the top of guest_indirect_call.
+ */
+static _Thread_local bool inline_import_call;
+
+static bool kernelbase_fallback(const char *name, bool inline_frame, uint64_t *result) {
+    static _Thread_local unsigned depth;
+    uint64_t *cpu = (uint64_t *)current_cpu;
+    if (!cpu || depth > 8 || !is_lifted_system_dll("kernelbase.dll"))
+        return false;
+    pthread_mutex_lock(&module_translation_lock);
+    struct guest_module *module = loaded_module_named("kernelbase.dll");
+    if (!module) {
+        uint64_t handle = load_application_module("kernelbase.dll");
+        module = handle ? find_guest_module(handle) : NULL;
+    }
+    uint64_t target = module ? module_export(module, name, 0) : 0;
+    pthread_mutex_unlock(&module_translation_lock);
+    /* Forwarders back into runtime system code would loop. */
+    if (!target || system_thunk_name(target))
+        return false;
+    void (*fn)(void *, uint64_t) = guest_lookup_dispatch(target);
+    if (!fn)
+        return false;
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("ARM64_RECOMPILER_TRACE_IMPORTS") != NULL;
+    if (trace)
+        fprintf(stderr, "[fallback] %s -> kernelbase.dll %#llx\n", name, (unsigned long long)target);
+    uint64_t saved[128];
+    memcpy(saved, cpu, sizeof saved);
+    /* The callee expects [rsp] = return address, stack arguments at rsp+40. An
+       inline caller has not pushed one, so push a slot below its frame. */
+    if (inline_frame)
+        cpu[7] -= 8;
+    uint64_t rsp = cpu[7], return_address = guest_load(rsp, 8);
+    guest_store(rsp, 0, 8); /* the callee returns to return_va 0 */
+    ++depth;
+    fn(cpu, 0);
+    --depth;
+    *result = cpu[0];
+    if (trace)
+        fprintf(stderr, "[fallback] %s = %#llx\n", name, (unsigned long long)*result);
+    memcpy(cpu, saved, sizeof saved);
+    guest_store(rsp, return_address, 8);
+    current_cpu = cpu;
+    return true;
+}
+
+uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
+                             uint64_t third, uint64_t fourth);
+
+uint64_t guest_indirect_call_inline(uint64_t target, uint64_t first, uint64_t second,
+                                    uint64_t third, uint64_t fourth) {
+    inline_import_call = true;
+    return guest_indirect_call(target, first, second, third, fourth);
+}
+
 uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
                              uint64_t third, uint64_t fourth) {
+    bool inline_frame = inline_import_call;
+    inline_import_call = false;
     if (target >= SERVICE_TARGET && target - SERVICE_TARGET < sizeof service_exports / sizeof *service_exports)
         return call_service(target - SERVICE_TARGET, first, second, third, fourth);
     (void)fourth;
@@ -4183,6 +4295,8 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
                 return (uint64_t)(int64_t)((uint64_t)length >= second ? -1 : length);
             }
 
+            if (kernelbase_fallback(name, inline_frame, &shim_res))
+                return shim_res;
             return guest_unimplemented_stub(name, "wine_api");
         }
     }

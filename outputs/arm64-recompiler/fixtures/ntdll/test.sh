@@ -79,4 +79,9 @@ grep -qE '^\[bind\] kernelbase\.dll!PathCchCombine -> kernelbase\.dll ' "$build/
 # kernelbase's own ntdll imports bind into the lifted ntdll, and its DllMain loads locale data.
 grep -q '^\[override\] NtInitializeNlsFiles(' "$build/kernelbase.stderr" ||
     { echo "FAIL kernelbase DllMain did not initialize locale data" >&2; exit 1; }
-echo "PASS Wine kernelbase.dll lifted on the lifted ntdll.dll (real DllMain, lifted exports)"
+# kernel32 functions without a runtime shim run kernelbase's lifted code.
+for name in GetLocaleInfoW CompareStringOrdinal lstrcmpiW ExpandEnvironmentStringsW; do
+    grep -q "^\[fallback\] $name -> kernelbase\.dll " "$build/kernelbase.stderr" ||
+        { echo "FAIL kernel32!$name did not fall back to kernelbase.dll" >&2; exit 1; }
+done
+echo "PASS Wine kernelbase.dll lifted on the lifted ntdll.dll (real DllMain, lifted exports, kernel32 fallback)"

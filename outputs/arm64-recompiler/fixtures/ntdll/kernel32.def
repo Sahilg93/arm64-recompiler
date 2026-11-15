@@ -6,3 +6,8 @@ HeapFree
 SetLastError
 GetLastError
 GetModuleHandleW
+GetUserDefaultLCID
+GetLocaleInfoW
+CompareStringOrdinal
+lstrcmpiW
+ExpandEnvironmentStringsW
