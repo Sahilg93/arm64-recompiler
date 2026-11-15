@@ -228,6 +228,40 @@ def lift_module(path, image, work, registry, load_base, trace=False, available=N
 MODULE_FLAGS = ("-O2",)
 
 
+def program_flags():
+    """Optimization level for the program's own lifted code (ARM64_RECOMPILER_PROGRAM_OPT)."""
+    return (os.environ.get("ARM64_RECOMPILER_PROGRAM_OPT") or "-O2",)
+
+
+def compile_program(source, target, no_cache=False):
+    """Compile the program's lifted IR to an object, reusing one built from the same IR.
+
+    The program is one large translation unit, which clang optimizes on a single
+    thread: about a minute for PuTTY's size. The object is kept in the module
+    store under the hash of the IR and the flags, so only the first build of a
+    program (or of a changed lifter) pays for it.
+    """
+    import shutil
+    flags = program_flags()
+    cached = None
+    if not no_cache:
+        hasher = hashlib.sha256(Path(source).read_bytes())
+        hasher.update(repr(flags).encode())
+        hasher.update(subprocess.run(["clang", "--version"], capture_output=True).stdout)
+        store = module_store()
+        store.mkdir(parents=True, exist_ok=True)
+        cached = store / f"program_{hasher.hexdigest()[:24]}.o"
+        if cached.exists():
+            shutil.copyfile(cached, target)
+            return
+    subprocess.run(["clang", "-arch", "arm64", *flags, "-Wno-override-module",
+                    "-c", str(source), "-o", str(target)], check=True)
+    if cached:
+        scratch = cached.with_name(f".{cached.name}.{os.getpid()}")
+        shutil.copyfile(target, scratch)
+        scratch.replace(cached)
+
+
 def compile_parallel(sources, work, flags=MODULE_FLAGS):
     """Compile independent C / LLVM IR translation units to objects on all cores.
 
@@ -465,8 +499,7 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
                 f"const char *guest_module_store = {json.dumps(str(store))};", "")))
             primary_object = work / "main.o"
             with ThreadPoolExecutor(max_workers=2) as pool:
-                primary_job = pool.submit(subprocess.run, ["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
-                                          "-c", str(primary), "-o", str(primary_object)], check=True)
+                primary_job = pool.submit(compile_program, primary, primary_object)
                 objects = pool.submit(compile_parallel, [root / "console_runtime.c", source], work,
                                       MODULE_FLAGS).result()
                 primary_job.result()
@@ -512,11 +545,10 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
             modules.append(source)
         output = work / "runner"
         primary_object = work / "main.o"
-        # The primary module stays at -O0; the runtime, lifted DLLs, and
-        # registry build at -O2. All compile concurrently.
+        # The program's own code builds at program_flags(); the runtime, lifted
+        # DLLs, and registry build at -O2. All compile concurrently.
         with ThreadPoolExecutor(max_workers=2) as pool:
-            primary_job = pool.submit(subprocess.run, ["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
-                                      "-c", str(primary), "-o", str(primary_object)], check=True)
+            primary_job = pool.submit(compile_program, primary, primary_object, no_cache)
             others = pool.submit(compile_parallel, [root / "console_runtime.c", *modules[1:]], work,
                                  MODULE_FLAGS)
             primary_job.result()

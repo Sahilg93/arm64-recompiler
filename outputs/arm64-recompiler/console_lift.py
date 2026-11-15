@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import bisect
@@ -165,6 +166,9 @@ def inline_guest_memory(text):
     return text + helpers + GUEST_TBAA
 
 
+# Slot of the guest CPU state holding the last traced guest address (CPU_TRACED_PC in console_runtime.c).
+CPU_TRACED_PC = 127
+
 GUEST_IMAGE_ALIGN = 16384  # Apple Silicon page size: the runtime remaps DLL images by page
 
 SCALAR_SINGLE_OPS = {"addss", "subss", "mulss", "divss", "sqrtss", "maxss", "minss", "ucomiss", "comiss",
@@ -213,6 +217,12 @@ class ConsoleLift(Lift):
         # Tolerant lifting turns undecodable or unsupported instructions into
         # runtime traps (like trace mode) without per-instruction PC updates.
         self.tolerant = tolerant or trace
+        # Tracing records the guest address before every instruction: by default one
+        # store into the CPU state, which costs almost nothing. The runtime's
+        # GUEST_WATCH_RVA and ARM64_RECOMPILER_PC_LOG need a call per instruction
+        # instead; lift with ARM64_RECOMPILER_TRACE_HOOKS=1 to get that. Lifted DLLs
+        # always use the call (their trace is a debugging aid, not a build mode).
+        self.trace_hooks = bool(os.environ.get("ARM64_RECOMPILER_TRACE_HOOKS"))
         # Lowercase import DLL names whose IAT slots the runtime loader binds to
         # lifted guest modules. Calls through those slots dispatch to the bound
         # value; other imports use the runtime's named shims.
@@ -3044,6 +3054,8 @@ class ConsoleLift(Lift):
             self.line(f"  %{name} = getelementptr i64, ptr %cpu, i32 {i}")
         for i, name in enumerate(self.cpu_slots):
             self.line(f"  %{name}_width = getelementptr i64, ptr %cpu, i32 {count + i}")
+        if self.trace and not self.trace_hooks:
+            self.line(f"  %traced_pc = getelementptr i64, ptr %cpu, i32 {CPU_TRACED_PC}")
 
     def function(self, target):
         if target not in self.functions:
@@ -3092,8 +3104,10 @@ class ConsoleLift(Lift):
                     continue
                 self.occupied.update(dict.fromkeys(instruction_bytes, address))
                 self.decoded[address] = ins
-            if self.trace:
+            if self.trace and self.trace_hooks:
                 self.line(f"  call void @guest_set_pc(i64 {address})")
+            elif self.trace:
+                self.line(f"  store i64 {address}, ptr %traced_pc")
             if self.fault_delivery:
                 self.line(f"  call void @guest_mark_fault_pc(i64 {self.image_base + address})")
             if self.fault_delivery and self.trace and ins.mnemonic == "call":

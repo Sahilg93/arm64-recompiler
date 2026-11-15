@@ -257,6 +257,17 @@ static bool fits(uint64_t addr, uint64_t size, uint64_t start, uint64_t length) 
 }
 
 static _Thread_local uint64_t guest_pc, guest_fault_pc;
+/*
+ * Traced lifted code stores the address of each instruction in this slot of its
+ * CPU state (CPU_TRACED_PC in console_lift.py) instead of calling guest_set_pc.
+ */
+enum { CPU_TRACED_PC = 127 };
+
+/* The last traced guest address on this thread, for diagnostics. */
+static uint64_t traced_pc(void) {
+    const uint64_t *cpu = current_cpu;
+    return cpu && cpu[CPU_TRACED_PC] ? cpu[CPU_TRACED_PC] : guest_pc;
+}
 static _Thread_local bool delivering_fault;
 
 /*
@@ -402,6 +413,8 @@ void guest_set_pc(uint64_t address) {
     if (pc_log)
         fprintf(pc_log, "%llx\n", (unsigned long long)address);
     guest_pc = address;
+    if (current_cpu)
+        ((uint64_t *)current_cpu)[CPU_TRACED_PC] = address;
     if (address == watched_rva) {
         fprintf(stderr, "Reached guest RVA %#llx\n", (unsigned long long)address);
         watched_rva = UINT64_MAX;
@@ -581,7 +594,7 @@ static bool wine_debug_enabled(void) {
 }
 
 static void fault(void) {
-    fprintf(stderr, "RVA %#llx: unsupported guest memory access\n", (unsigned long long)guest_pc);
+    fprintf(stderr, "RVA %#llx: unsupported guest memory access\n", (unsigned long long)traced_pc());
     exit(125);
 }
 
@@ -1610,7 +1623,7 @@ static uint64_t load_named_module(const char *module, uint64_t reserved, uint32_
             return handle;
     }
     fprintf(stderr, "RVA %#llx: unsupported DLL load for %s, flags %#x\n",
-            (unsigned long long)guest_pc, module, flags);
+            (unsigned long long)traced_pc(), module, flags);
     exit(125);
 }
 
@@ -3918,7 +3931,7 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
         }
         if (slots[index].callback && local[index].value) {
             fprintf(stderr, "RVA %#llx: FlsFree needs guest callback %#llx\n",
-                    (unsigned long long)guest_pc, (unsigned long long)slots[index].callback);
+                    (unsigned long long)traced_pc(), (unsigned long long)slots[index].callback);
             exit(125);
         }
         slots[index].allocated = false;
@@ -4526,7 +4539,7 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
     if (target >= 0x7fff0000 && target < 0x80000000)
         return 0;
     fprintf(stderr, "RVA 0x%llx: unsupported indirect call target 0x%llx\n",
-            (unsigned long long)guest_pc, (unsigned long long)target);
+            (unsigned long long)traced_pc(), (unsigned long long)target);
     exit(125);
 }
 
@@ -5417,7 +5430,7 @@ void guest_check_return(uint64_t addr, uint64_t expected) {
         fputs("guest return address mismatch\n", stderr);
         fprintf(stderr, "actual %#llx != expected %#llx at rsp %#llx, last traced RVA %#llx\n",
                 (unsigned long long)actual, (unsigned long long)expected, (unsigned long long)addr,
-                (unsigned long long)guest_pc);
+                (unsigned long long)traced_pc());
         exit(125);
     }
 }
@@ -5510,7 +5523,7 @@ static void capture_guest_context(uint64_t ctx, uint64_t pc, uint64_t rsp) {
 
 void guest_rtl_capture_context(uint64_t ctx) {
     if (ctx)
-        capture_guest_context(ctx, guest_pc, current_cpu ? ((uint64_t *)current_cpu)[7] : 0);
+        capture_guest_context(ctx, traced_pc(), current_cpu ? ((uint64_t *)current_cpu)[7] : 0);
 }
 
 

@@ -137,6 +137,8 @@ A lifted DLL is built once as its own shared library and reused by every program
 - The store is `~/Library/Caches/arm64-recompiler/modules`; set `ARM64_RECOMPILER_MODULE_STORE` to move it.
 - At startup the runtime looks for each library in `ARM64_RECOMPILER_MODULE_DIR`, beside the program, in `../Frameworks`, then in the store.
 - `ARM64_RECOMPILER_STATIC_MODULES=1` or `ARM64_RECOMPILER_NO_CACHE=1` links the DLLs into the program instead.
+- The program's own lifted code is compiled at `-O2` and its object is kept in the same store, keyed by the lifted IR, so only the first build of a program pays for it (about a minute for Plink). `ARM64_RECOMPILER_PROGRAM_OPT=-O0` trades run time for build time.
+- Programs lifted with `--trace` record the current guest address with one store per instruction. The runtime's `GUEST_WATCH_RVA` and `ARM64_RECOMPILER_PC_LOG` debugging aids need a call per instruction instead: lift with `ARM64_RECOMPILER_TRACE_HOOKS=1` to use them.
 - A library is rebuilt when the DLL or the lifter changes, but not when only `console_runtime.c` changes. After a runtime change that alters what lifted code expects, clear the store.
 
 With shared modules the GUI fixture's binary is under 1 MB instead of 40 MB.
@@ -157,16 +159,17 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 
 ### Hosted Programs (PuTTY GUI and Plink over SSH)
 
-Measured on an Apple M1, five runs per variant after one warm-up. Every run starts from a stopped `wineserver`, so its start-up is included in both columns. Memory is the resident size of the program's own process.
+Measured on an Apple M1, five runs per variant after one warm-up, with other work running on the machine. "Cold" runs start from a stopped `wineserver`, so its start-up is included in both columns; "warm" runs find it already running. Memory is the resident size of the program's own process.
 
 | Measurement | Lifted ARM64 (hosted) | Original under Wine + Rosetta | Ratio |
 | --- | ---: | ---: | ---: |
-| PuTTY: launch to configuration window (min / median / max) | **1642 / 1672 / 1736 ms** | 1896 / 1936 / 2105 ms | 1.16× faster |
-| PuTTY: resident memory with the dialog open | 127 MB | 59 MB | 2.2× more |
-| Plink: SSH login, `echo`, exit (min / median / max) | 6295 / 6348 / 6497 ms | **5744 / 5803 / 5935 ms** | 0.91× (slower) |
-| Plink: peak resident memory | 41.7 MB | 22.7 MB | 1.8× more |
+| PuTTY: launch to configuration window, cold (min / median / max) | **1798 / 1932 / 1989 ms** | 2116 / 2148 / 2293 ms | 1.11× faster |
+| PuTTY: resident memory with the dialog open | 125 MB | 63 MB | 2.0× more |
+| Plink: SSH login, `echo`, exit, cold (min / median / max) | 1692 / 1839 / 2220 ms | 1735 / 1802 / 1847 ms | 0.98× (about equal) |
+| Plink: SSH login, `echo`, exit, warm (min / median / max) | **284 / 293 / 296 ms** | 389 / 452 / 583 ms | 1.54× faster |
+| Plink: peak resident memory | 36.5 MB | 22.7 MB | 1.6× more |
 
-The lifted GUI reaches its window sooner, but the SSH command is slower and both use about twice the memory. Two known causes: programs lifted with `--trace` (PuTTY and Plink need it) have their own code compiled without optimization, which is where the key-exchange arithmetic runs, and every linked DLL is loaded at startup whether it is used or not.
+Cold starts are dominated by `wineserver` start-up, which both variants pay, so the lifted programs are only slightly ahead or level there. With the server running, the lifted SSH command is about one and a half times as fast. Memory use is 1.6 to 2 times higher; that has not been investigated yet. The program's own code is compiled at `-O2` (set `ARM64_RECOMPILER_PROGRAM_OPT` to change it), and `--trace` costs one store per guest instruction.
 
 ---
 
@@ -213,7 +216,7 @@ The long-term vision for this project is to expand beyond console utilities and 
 The GUI half of this plan now exists as hosted mode (see the quickstart). It goes one step further than thunking into Wine: Wine's Windows-side DLLs are lifted along with the program, and only Wine's unix-side syscall layer runs as native code. Current limits:
 
 - Wine's `wineserver` and its helper processes are still the x86-64 install's own, so they run under Rosetta, and a Wine prefix is required. There is no standalone `.app` bundle yet.
-- Every linked DLL is loaded at startup, used or not, and programs lifted with `--trace` run their own code unoptimized (see the hosted measurements above).
+- Every linked DLL is loaded at startup, used or not. That costs little time (tens of milliseconds for Plink's 14), but lifted programs use 1.6 to 2 times the memory of the original under Wine.
 - `DLL_THREAD_ATTACH` is not delivered to threads Wine creates.
 - Instruction coverage is still driven by the programs tried so far: AES-NI, SHA, carry-less multiply and AVX are not lifted.
 - Direct3D and the "Metal thunking" part of the diagram are not started.
