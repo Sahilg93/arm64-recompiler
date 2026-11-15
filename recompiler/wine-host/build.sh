@@ -10,7 +10,7 @@
 # probes), FreeType, and bison >= 3 (macOS ships 2.3; `brew install bison`).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-repository="$(cd "$here/../../.." && pwd)"
+repository="$(cd "$here/../.." && pwd)"
 work="${1:?usage: build.sh <work-dir>}"
 mkdir -p "$work"
 work="$(cd "$work" && pwd)"

@@ -13,11 +13,11 @@ the main thread, then unloads the DLL.
 ## Native ARM64 regression test
 
 From the repository root, using Clang and the Python environment from
-`outputs/arm64-recompiler/requirements.txt`:
+`recompiler/requirements.txt`:
 
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" \
-  outputs/arm64-recompiler/fixtures/dynamic_dll/test.sh
+  recompiler/fixtures/dynamic_dll/test.sh
 ```
 
 This builds and runs the main-thread and worker-thread variants with the
@@ -29,7 +29,7 @@ missing, changed, and unrelated DLL files.
 From the repository root, after building the fixture:
 
 ```sh
-work/venv/bin/python3 outputs/arm64-recompiler/run_exe.py work/dynamic-dll/fixture.exe
+work/venv/bin/python3 recompiler/run_exe.py work/dynamic-dll/fixture.exe
 ```
 
 The launcher starts the translated EXE in its own directory. When the
@@ -41,7 +41,7 @@ launcher passes through arguments and returns the guest exit status.
 ## Reproduce manually or compare with Wine
 
 ```sh
-tool=outputs/arm64-recompiler
+tool=recompiler
 fixture="$PWD/work/dynamic-dll"
 export PYTHON="$PWD/work/venv/bin/python3"
 "$tool/fixtures/dynamic_dll/build.sh" "$fixture"

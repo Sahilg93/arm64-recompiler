@@ -6,7 +6,7 @@
 set -euo pipefail
 fixture="$(cd "$(dirname "$0")" && pwd)"
 tool="$(cd "$fixture/../.." && pwd)"
-repository="$(cd "$tool/../.." && pwd)"
+repository="$(cd "$tool/.." && pwd)"
 python="${PYTHON:-python3}"
 sdk="${XWIN_SDK:?Set XWIN_SDK to the SDK and CRT directory prepared by xwin}"
 compiler="${CLANG_CL:-clang-cl}"

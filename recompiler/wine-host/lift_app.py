@@ -20,7 +20,7 @@ import sys
 import pefile
 
 TOOL = Path(__file__).resolve().parent.parent
-REPOSITORY = TOOL.parent.parent
+REPOSITORY = TOOL.parent
 sys.path.insert(0, str(TOOL))
 from build_console_modules import build, resolve_api_set  # noqa: E402
 

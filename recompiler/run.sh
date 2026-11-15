@@ -147,7 +147,7 @@ clang -arch arm64 -O1 -w test_mmap.c -o "$build/test_mmap"
 
 # Optional Wine oracle: WINE/WINEPREFIX, else the copy setup_wine.py installs,
 # else the one under work/. Without Wine the fixtures still run on ARM64.
-repository="$(cd ../.. && pwd)"
+repository="$(cd .. && pwd)"
 if [[ -z "${WINE:-}" ]]; then
     for candidate in "$PWD/wine-runtime/Wine Stable.app/Contents/Resources/wine/bin/wine" \
                      "$repository/work/wine/Wine Stable.app/Contents/Resources/wine/bin/wine"; do

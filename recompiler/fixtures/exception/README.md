@@ -3,7 +3,7 @@
 From the repository root on Apple Silicon:
 
 ```sh
-PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/fixtures/exception/test.sh
+PYTHON="$PWD/work/venv/bin/python3" recompiler/fixtures/exception/test.sh
 ```
 
 Set `WINE` to a Wine executable and `WINEPREFIX` to a configured prefix to run

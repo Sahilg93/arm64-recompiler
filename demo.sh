@@ -12,4 +12,4 @@ else
     PY="python3"
 fi
 
-exec "$PY" "$DIR/outputs/arm64-recompiler/interactive_demo.py" "$@"
+exec "$PY" "$DIR/recompiler/interactive_demo.py" "$@"

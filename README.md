@@ -24,15 +24,15 @@ This is not a general "run any Windows binary" tool.
 
 ## Demo
 
-![Plink -V running natively, then the lifted PuTTY GUI opening an SSH session](outputs/arm64-recompiler/docs/demo.gif)
+![Plink -V running natively, then the lifted PuTTY GUI opening an SSH session](recompiler/docs/demo.gif)
 
-[Full-resolution video (1080p MP4)](outputs/arm64-recompiler/docs/demo-16x9.mp4). The PuTTY windows are captures of the lifted program running, with the wait before the SSH window shortened. The Plink terminal is rendered from the binary's real output.
+[Full-resolution video (1080p MP4)](recompiler/docs/demo-16x9.mp4). The PuTTY windows are captures of the lifted program running, with the wait before the SSH window shortened. The Plink terminal is rendered from the binary's real output.
 
 | PuTTY configuration dialog | PuTTY SSH session |
 | --- | --- |
-| ![Lifted PuTTY configuration dialog](outputs/arm64-recompiler/docs/putty-config.png) | ![Lifted PuTTY SSH session](outputs/arm64-recompiler/docs/putty-ssh.png) |
+| ![Lifted PuTTY configuration dialog](recompiler/docs/putty-config.png) | ![Lifted PuTTY SSH session](recompiler/docs/putty-ssh.png) |
 | **PuTTY raw TCP session** | **Wine Task Manager** |
-| ![Lifted PuTTY raw terminal session](outputs/arm64-recompiler/docs/putty-terminal.png) | ![Lifted Wine Task Manager](outputs/arm64-recompiler/docs/taskmgr.png) |
+| ![Lifted PuTTY raw terminal session](recompiler/docs/putty-terminal.png) | ![Lifted Wine Task Manager](recompiler/docs/taskmgr.png) |
 
 The text in the two terminal windows was sent by the test server (a local OpenSSH server and a local TCP server).
 
@@ -86,7 +86,7 @@ From the repository root on an Apple Silicon Mac with Clang and Python. To set u
 
 ```sh
 python3 -m venv work/venv
-work/venv/bin/python3 -m pip install -r outputs/arm64-recompiler/requirements.txt
+work/venv/bin/python3 -m pip install -r recompiler/requirements.txt
 ```
 
 ### 1. Run the regression test suite
@@ -94,8 +94,19 @@ work/venv/bin/python3 -m pip install -r outputs/arm64-recompiler/requirements.tx
 Exercises 11,121 arithmetic and control-flow instruction permutations, atomic `lock cmpxchg`, data relocations, and console tests:
 
 ```sh
-PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/run.sh
+PYTHON="$PWD/work/venv/bin/python3" recompiler/run.sh
 ```
+
+It also runs the virtual-memory test (`test_mmap.c`) and seven fixtures:
+- `recompiler/fixtures/vm_fault`: raw `VirtualAlloc` faults reach VEH and table-driven SEH handlers, including a resumption in the middle of a function.
+- `recompiler/fixtures/jit`: runtime-generated code in `PAGE_EXECUTE*` buffers runs in the fallback x86 interpreter, plus RWX patching and DEP faults.
+- `recompiler/fixtures/exception/test_msvc.sh`: MSVC C++ EH and `__try`/`__except`.
+- `recompiler/fixtures/ntdll`: Wine's x64 `ntdll.dll` and `kernelbase.dll` are lifted as guest modules when they are shipped beside the program. Wine's own `Rtl*`, path, string and locale code runs as lifted code, including kernelbase's real `DllMain`. ntdll exports that own process-wide state stay in the runtime, so heaps, last error, locks, TLS/FLS, the loader and exceptions are shared with the runtime's kernel32. Those exports are the syscall stubs plus the list in `NTDLL_RUNTIME_EXPORTS` in `recompiler/build_console_modules.py`. Unimplemented syscalls return `STATUS_NOT_IMPLEMENTED`. When kernelbase.dll is shipped, a kernel32 (or other system) function with no runtime shim falls back to kernelbase's lifted export of the same name. The runtime also installs ntdll's code-page and case tables, the startup step Wine's own loader normally performs. kernelbase reads Wine's NLS tables from `ARM64_RECOMPILER_NLS_DIR`, which the fixture sets to Wine's `share/wine/nls`.
+- `recompiler/fixtures/gui`: a Win32 program registers a class, opens a window and paints it through lifted `user32.dll` and `gdi32.dll`, with the syscalls served natively by `win32u.so` and `winemac.so`. Needs the hosted-mode build (`recompiler/wine-host/build.sh`) and a logged-in GUI session; otherwise it prints `SKIP`.
+- `recompiler/fixtures/winsock`: a TCP client connects to a local echo server, sends, waits with `select` and receives, through lifted `ws2_32.dll` and the native socket layer. Needs the hosted-mode build.
+- `recompiler/fixtures/crt`: Wine's real x64 `ucrtbase.dll` is lifted and loaded in place of the runtime's CRT shims. This covers API sets, ordinal imports, forwarded exports, and `DllMain` attach/detach order. It needs the same SDK tools as the MSVC case, plus a `ucrtbase.dll` from Wine.
+
+The fixtures compare against Wine when it is installed (`recompiler/setup_wine.py`, or `WINE`/`WINEPREFIX`). The MSVC case needs an xwin SDK (`XWIN_SDK`) and LLVM `clang-cl`/`lld-link`. Without them it prints `SKIP`, or fails if `REQUIRE_MSVC=1`.
 
 ### 2. Reproduce the Plink milestone
 
@@ -103,7 +114,7 @@ Recompiles the original `plink.exe` and verifies `-V` output and exit status:
 
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" \
-  outputs/arm64-recompiler/test_plink_startup.sh "$PWD/work/corpus/plink.exe"
+  recompiler/test_plink_startup.sh "$PWD/work/corpus/plink.exe"
 ```
 
 With automatic `.pdata` function discovery, this succeeds on **attempt 0**, printing `plink: Release 0.83` and exiting with status 0.
@@ -114,11 +125,11 @@ Needs a matching LLVM 22 Clang and `llvm-link`. Set `LLVM_BIN` to their bin dire
 
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" \
-  outputs/arm64-recompiler/build_jq.sh work/corpus/jq.exe work/build/jq-arm64
+  recompiler/build_jq.sh work/corpus/jq.exe work/build/jq-arm64
 curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64 \
   -o work/build/jq-reference
 chmod +x work/build/jq-reference
-work/venv/bin/python3 outputs/arm64-recompiler/test_jq.py work/build/jq-arm64 work/build/jq-reference
+work/venv/bin/python3 recompiler/test_jq.py work/build/jq-arm64 work/build/jq-reference
 ```
 
 The test checks stdout, stderr, and exit codes for stdin, file input, Unicode filenames, sorting, regex, malformed JSON, and jq's `-e` behavior.
@@ -129,7 +140,7 @@ The fixture builds a Windows EXE and DLL, recompiles them to ARM64, and checks r
 
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" \
-  outputs/arm64-recompiler/fixtures/dynamic_dll/test.sh
+  recompiler/fixtures/dynamic_dll/test.sh
 ```
 
 ### 5. Trace startup of corpus binaries
@@ -138,10 +149,10 @@ Trace native execution and inspect the stopping point for other Windows binaries
 
 ```sh
 # jq 1.8.2
-$PWD/work/venv/bin/python3 outputs/arm64-recompiler/trace_callbacks.py --max-attempts 1 work/corpus/jq.exe --version
+$PWD/work/venv/bin/python3 recompiler/trace_callbacks.py --max-attempts 1 work/corpus/jq.exe --version
 
 # ripgrep 14.1.1
-$PWD/work/venv/bin/python3 outputs/arm64-recompiler/run_exe.py --trace work/corpus/rg.exe --threads 1 --no-config --no-heading --sort path -n PATTERN DIRECTORY
+$PWD/work/venv/bin/python3 recompiler/run_exe.py --trace work/corpus/rg.exe --threads 1 --no-config --no-heading --sort path -n PATTERN DIRECTORY
 ```
 
 ### 6. Run a Windows GUI or network program (hosted mode)
@@ -149,19 +160,19 @@ $PWD/work/venv/bin/python3 outputs/arm64-recompiler/run_exe.py --trace work/corp
 Hosted mode needs an x86-64 Wine 11.0 install (`setup_wine.py` puts one under `work/wine`) and Wine's unix side built natively for arm64. Build that once (needs Xcode's clang, Homebrew LLVM, FreeType and `bison` 3 or newer):
 
 ```sh
-outputs/arm64-recompiler/wine-host/build.sh "$PWD/work/wine-host"
+recompiler/wine-host/build.sh "$PWD/work/wine-host"
 ```
 
 Then `lift_app.py` lifts a program together with the Wine DLLs it needs and can start it. It follows static imports, export forwarders, and delay imports one level deep:
 
 ```sh
 # Wine's Task Manager: tab control, list views, status bar, worker threads.
-work/venv/bin/python3 outputs/arm64-recompiler/wine-host/lift_app.py \
+work/venv/bin/python3 recompiler/wine-host/lift_app.py \
   "work/wine/Wine Stable.app/Contents/Resources/wine/lib/wine/x86_64-windows/taskmgr.exe" \
   work/build/taskmgr --run
 
 # PuTTY 0.83 GUI (download putty.exe from the PuTTY site and check its SHA-256 first).
-work/venv/bin/python3 outputs/arm64-recompiler/wine-host/lift_app.py \
+work/venv/bin/python3 recompiler/wine-host/lift_app.py \
   work/corpus/putty-0.83/putty.exe work/build/putty \
   --dll ws2_32.dll --dll comctl32.dll --trace --run
 ```
@@ -274,19 +285,19 @@ Rather than writing a replacement for the Windows GUI subsystems (USER32, GDI, D
 
 | Path | Contents |
 | --- | --- |
-| [`outputs/arm64-recompiler/`](outputs/arm64-recompiler/) | Core lifters, runtime emulation, diagnostics, and test harness |
-| [`outputs/arm64-recompiler/console_lift.py`](outputs/arm64-recompiler/console_lift.py) | Whole-program PE x86-64 lifter emitting LLVM IR |
-| [`outputs/arm64-recompiler/console_runtime.c`](outputs/arm64-recompiler/console_runtime.c) | Minimal Win32 / CRT runtime shim (memory, TEB/PEB, TLS, FLS, sync, stdio) |
-| [`outputs/arm64-recompiler/build_console_modules.py`](outputs/arm64-recompiler/build_console_modules.py) | Builds a program with its lifted DLLs; owns the shared module store |
-| [`outputs/arm64-recompiler/wine-host/`](outputs/arm64-recompiler/wine-host/) | Hosted mode: Wine 11.0 unix-side build, host-mode patch, syscall thunks, and `lift_app.py` |
-| [`outputs/arm64-recompiler/fixtures/`](outputs/arm64-recompiler/fixtures/) | End-to-end fixtures (faults, JIT, exceptions, ntdll, CRT, GUI, Winsock, DLL loading) |
+| [`recompiler/`](recompiler/) | Core lifters, runtime emulation, diagnostics, and test harness |
+| [`recompiler/console_lift.py`](recompiler/console_lift.py) | Whole-program PE x86-64 lifter emitting LLVM IR |
+| [`recompiler/console_runtime.c`](recompiler/console_runtime.c) | Minimal Win32 / CRT runtime shim (memory, TEB/PEB, TLS, FLS, sync, stdio) |
+| [`recompiler/build_console_modules.py`](recompiler/build_console_modules.py) | Builds a program with its lifted DLLs; owns the shared module store |
+| [`recompiler/wine-host/`](recompiler/wine-host/) | Hosted mode: Wine 11.0 unix-side build, host-mode patch, syscall thunks, and `lift_app.py` |
+| [`recompiler/fixtures/`](recompiler/fixtures/) | End-to-end fixtures (faults, JIT, exceptions, ntdll, CRT, GUI, Winsock, DLL loading) |
 | [`WAR_STORIES.md`](WAR_STORIES.md) | Post-mortem of failures, subtle bugs, and how they were fixed |
 | [`work/corpus/`](work/corpus/) | Original Windows x64 release binaries (`plink.exe`, `jq.exe`, `rg.exe`) |
 | [`work/`](work/) | Test environments, diagnostic traces, and generated builds |
 
 ## Additional documentation
 
-- [Start Here & Quick Reference](outputs/arm64-recompiler/START.md): environment setup and command-line usage.
-- [Corpus Audit Notes](outputs/arm64-recompiler/CORPUS.md): analysis of the external Windows release binaries, including PuTTY's download link and SHA-256.
-- [Export Lifting Experiments](outputs/arm64-recompiler/EXPORTS.md): function-level translation for SQLite and xxHash DLL exports.
-- [Wine Reference Setup](outputs/arm64-recompiler/WINDOWS.md): setup notes for the comparison baseline.
+- [Start Here & Quick Reference](recompiler/START.md): environment setup and command-line usage.
+- [Corpus Audit Notes](recompiler/CORPUS.md): analysis of the external Windows release binaries, including PuTTY's download link and SHA-256.
+- [Export Lifting Experiments](recompiler/EXPORTS.md): function-level translation for SQLite and xxHash DLL exports.
+- [Wine Reference Setup](recompiler/WINDOWS.md): setup notes for the comparison baseline.

@@ -6,7 +6,7 @@
 # usage: test.sh <work-dir>   (the directory given to build.sh)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-repository="$(cd "$here/../../.." && pwd)"
+repository="$(cd "$here/../.." && pwd)"
 work="$(cd "${1:?usage: test.sh <work-dir>}" && pwd)"
 wine_root="${WINE_ROOT:-$repository/work/wine/Wine Stable.app/Contents/Resources/wine}"
 program="${HOST_PROGRAM:-$repository/work/corpus/jq.exe}"

@@ -77,7 +77,7 @@ def scan_directory(corpus_dir: Path, known_imports: set[str], top_n: int = 25):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("corpus", type=Path, nargs="?", default=Path(__file__).parent.parent.parent / "work" / "corpus")
+    parser.add_argument("corpus", type=Path, nargs="?", default=Path(__file__).parent.parent / "work" / "corpus")
     parser.add_argument("--lifter", type=Path, default=Path(__file__).parent / "console_lift.py")
     parser.add_argument("--top", type=int, default=25, help="Number of top functions to show")
     args = parser.parse_args()

@@ -3,7 +3,7 @@
 From the repository root on Apple Silicon:
 
 ```sh
-PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/fixtures/jit/test.sh
+PYTHON="$PWD/work/venv/bin/python3" recompiler/fixtures/jit/test.sh
 ```
 
 Set `WINE` (and `WINEPREFIX`) to also run the same EXE under Wine first. Wine

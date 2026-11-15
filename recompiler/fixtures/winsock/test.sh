@@ -6,7 +6,7 @@
 set -euo pipefail
 fixture="$(cd "$(dirname "$0")" && pwd)"
 tool="$(cd "$fixture/../.." && pwd)"
-repository="$(cd "$tool/../.." && pwd)"
+repository="$(cd "$tool/.." && pwd)"
 python="${PYTHON:-python3}"
 work="${WINE_HOST_WORK:-$repository/work/wine-host}"
 wine_root="${WINE_ROOT:-$repository/work/wine/Wine Stable.app/Contents/Resources/wine}"

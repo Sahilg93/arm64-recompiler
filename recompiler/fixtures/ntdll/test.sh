@@ -7,7 +7,7 @@
 set -euo pipefail
 fixture="$(cd "$(dirname "$0")" && pwd)"
 tool="$(cd "$fixture/../.." && pwd)"
-repository="$(cd "$tool/../.." && pwd)"
+repository="$(cd "$tool/.." && pwd)"
 python="${PYTHON:-python3}"
 ntdll="${NTDLL_DLL:-}"
 if [[ -z "$ntdll" ]]; then

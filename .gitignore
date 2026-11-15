@@ -15,7 +15,7 @@ work/venv/
 
 # Compiler and intermediate build outputs
 build/
-outputs/arm64-recompiler/build/
+recompiler/build/
 outputs/*.zip
 *.ll
 *.o
@@ -40,4 +40,4 @@ work/corpus/*.zip
 
 # Local caches (xwin downloads, lifter object cache)
 .xwin-cache/
-outputs/arm64-recompiler/.cache/
+recompiler/.cache/

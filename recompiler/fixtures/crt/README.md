@@ -5,7 +5,7 @@ From the repository root on Apple Silicon:
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" XWIN_SDK="$PWD/work/xwin-sdk" \
   CLANG_CL=/opt/homebrew/opt/llvm/bin/clang-cl \
-  outputs/arm64-recompiler/fixtures/crt/test.sh
+  recompiler/fixtures/crt/test.sh
 ```
 
 Set `WINE` and `WINEPREFIX` to compare with Wine first. `UCRTBASE_DLL` picks

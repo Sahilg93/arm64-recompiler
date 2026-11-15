@@ -221,7 +221,7 @@ def run_live_plink():
 
     if not os.path.exists(plink_arm64_bin):
         print(f"{RED}Executable {plink_arm64_bin} not found. Running compilation test...{RESET}")
-        cmd = f"PYTHON=\"$PWD/work/venv/bin/python3\" outputs/arm64-recompiler/test_plink_startup.sh work/corpus/plink.exe"
+        cmd = f"PYTHON=\"$PWD/work/venv/bin/python3\" recompiler/test_plink_startup.sh work/corpus/plink.exe"
         subprocess.run(cmd, shell=True)
         return
 

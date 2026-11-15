@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 W = ROOT / 'work'
 DATA = W / 'bench-suite-data'
 ENV = dict(os.environ, WINEDEBUG='-all', MVK_CONFIG_LOG_LEVEL='0')
-WINE = [sys.executable, str(ROOT / 'outputs/arm64-recompiler/run_windows.py'),
+WINE = [sys.executable, str(ROOT / 'recompiler/run_windows.py'),
         '--wine', str(W / 'wine/Wine Stable.app/Contents/Resources/wine/bin/wine'),
         '--prefix', str(W / 'wine/prefix')]
 NATIVE = W / 'native-tools/extract/native-tools'
