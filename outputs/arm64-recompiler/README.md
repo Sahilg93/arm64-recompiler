@@ -4,6 +4,12 @@ This project recompiles original Windows x86-64 PE binaries into LLVM IR and com
 
 The primary whole-program milestone is the original Windows release of **PuTTY Plink 0.83**, which runs `-V` natively on Apple Silicon through full CRT startup, argument parsing, standard output, and process shutdown. Its native output matches the original Windows binary running under Wine and Rosetta byte-for-byte, exiting status 0 with a **6.20× speedup** (42.31 ms vs. 262.23 ms) and a **68.9% smaller memory footprint** (5.51 MB vs. 17.74 MB RSS).
 
+The second milestone is real GUI and network software. The original Windows release of the **PuTTY 0.83 GUI** runs lifted on ARM64: its configuration dialog renders, and it opens raw and **SSH** terminal sessions (hybrid NTRU Prime / Curve25519 key exchange, Ed25519 public-key login, AES-256). Wine's own Task Manager runs the same way. These programs are hosted on Wine's unix side: the program and Wine's x86-64 Windows DLLs (`user32`, `gdi32`, `comctl32`, `ws2_32`, and the rest) are lifted to ARM64, and only the syscall layer (`ntdll.so`, `win32u.so`, `winemac.so`, `ws2_32.so`) is Wine's native code.
+
+| PuTTY configuration dialog | PuTTY terminal session |
+| --- | --- |
+| ![Lifted PuTTY configuration dialog](docs/putty-config.png) | ![Lifted PuTTY terminal session](docs/putty-terminal.png) |
+
 ---
 
 ## Directory Overview
@@ -12,6 +18,9 @@ The primary whole-program milestone is the original Windows release of **PuTTY P
 | --- | --- |
 | [`console_lift.py`](console_lift.py) | Whole-program PE x86-64 lifter emitting LLVM IR |
 | [`console_runtime.c`](console_runtime.c) | Minimal Win32 / CRT runtime shim (memory, TEB/PEB, TLS, FLS, sync, stdio) |
+| [`build_console_modules.py`](build_console_modules.py) | Builds a program with its lifted DLLs; owns the shared module store |
+| [`wine-host/`](wine-host/) | Hosted mode: Wine 11.0 unix-side build, host-mode patch, syscall thunks, and `lift_app.py` |
+| [`fixtures/`](fixtures/) | End-to-end fixtures (faults, JIT, exceptions, ntdll, CRT, GUI, Winsock, DLL loading) |
 | [`../../work/corpus/`](../../work/corpus/) | Original Windows x64 release binaries (`plink.exe`, `jq.exe`, `rg.exe`) |
 | [`../../work/`](../../work/) | Test environments, diagnostic traces, and generated builds |
 
@@ -26,11 +35,13 @@ Exercises 11,121 arithmetic & control-flow instruction permutations, atomic `loc
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/run.sh
 ```
-It also runs the virtual-memory test (`test_mmap.c`) and five fixtures:
+It also runs the virtual-memory test (`test_mmap.c`) and seven fixtures:
 - `fixtures/vm_fault`: raw `VirtualAlloc` faults reach VEH and table-driven SEH handlers, including a resumption in the middle of a function.
 - `fixtures/jit`: runtime-generated code in `PAGE_EXECUTE*` buffers runs in the fallback x86 interpreter, plus RWX patching and DEP faults.
 - `fixtures/exception/test_msvc.sh`: MSVC C++ EH and `__try`/`__except`.
 - `fixtures/ntdll`: Wine's x64 `ntdll.dll` and `kernelbase.dll` are lifted as guest modules when they are shipped beside the program. Wine's own `Rtl*`, path, string and locale code runs as lifted code, including kernelbase's real `DllMain`. ntdll exports that own process-wide state stay in the runtime, so heaps, last error, locks, TLS/FLS, the loader and exceptions are shared with the runtime's kernel32. Those exports are the syscall stubs plus the list in `NTDLL_RUNTIME_EXPORTS` in `build_console_modules.py`. Unimplemented syscalls return `STATUS_NOT_IMPLEMENTED`. When kernelbase.dll is shipped, a kernel32 (or other system) function with no runtime shim falls back to kernelbase's lifted export of the same name. The runtime also installs ntdll's code-page and case tables, the startup step Wine's own loader normally performs. kernelbase reads Wine's NLS tables from `ARM64_RECOMPILER_NLS_DIR`, which the fixture sets to Wine's `share/wine/nls`.
+- `fixtures/gui`: a Win32 program registers a class, opens a window and paints it through lifted `user32.dll` and `gdi32.dll`, with the syscalls served natively by `win32u.so` and `winemac.so`. Needs the hosted-mode build (`wine-host/build.sh`) and a logged-in GUI session; otherwise it prints `SKIP`.
+- `fixtures/winsock`: a TCP client connects to a local echo server, sends, waits with `select` and receives, through lifted `ws2_32.dll` and the native socket layer. Needs the hosted-mode build.
 - `fixtures/crt`: Wine's real x64 `ucrtbase.dll` is lifted and loaded in place of the runtime's CRT shims. This covers API sets, ordinal imports, forwarded exports, and `DllMain` attach/detach order. It needs the same SDK tools as the MSVC case, plus a `ucrtbase.dll` from Wine.
 
 The fixtures compare against Wine when it is installed (`setup_wine.py`, or `WINE`/`WINEPREFIX`). The MSVC case needs an xwin SDK (`XWIN_SDK`) and LLVM `clang-cl`/`lld-link`. Without them it prints `SKIP`, or fails if `REQUIRE_MSVC=1`.
@@ -86,6 +97,46 @@ $PWD/work/venv/bin/python3 outputs/arm64-recompiler/trace_callbacks.py --max-att
 $PWD/work/venv/bin/python3 outputs/arm64-recompiler/run_exe.py --trace work/corpus/rg.exe --threads 1 --no-config --no-heading --sort path -n PATTERN DIRECTORY
 ```
 
+### 6. Run a Windows GUI or Network Program (Hosted Mode)
+
+Hosted mode needs an x86-64 Wine 11.0 install (`setup_wine.py` puts one under `work/wine`) and Wine's unix side built natively for arm64. Build that once (needs Xcode's clang, Homebrew LLVM, FreeType and `bison` 3 or newer):
+
+```sh
+outputs/arm64-recompiler/wine-host/build.sh "$PWD/work/wine-host"
+```
+
+Then `lift_app.py` lifts a program together with the Wine DLLs it needs and can start it. It follows static imports, export forwarders, and delay imports one level deep:
+
+```sh
+# Wine's Task Manager: tab control, list views, status bar, worker threads.
+work/venv/bin/python3 outputs/arm64-recompiler/wine-host/lift_app.py \
+  "work/wine/Wine Stable.app/Contents/Resources/wine/lib/wine/x86_64-windows/taskmgr.exe" \
+  work/build/taskmgr --run
+
+# PuTTY 0.83 GUI (download putty.exe from the PuTTY site and check its SHA-256 first).
+work/venv/bin/python3 outputs/arm64-recompiler/wine-host/lift_app.py \
+  work/corpus/putty-0.83/putty.exe work/build/putty \
+  --dll ws2_32.dll --dll comctl32.dll --trace --run
+```
+
+- `--dll NAME` also lifts a Wine DLL the program loads with `LoadLibrary`.
+- `--delay-depth N` sets how many levels of delay imports to follow (default 1).
+- `--trace` accepts program code the lifter cannot translate yet. That code traps, reporting its address, only if execution reaches it. PuTTY needs this for its AES-NI and SHA paths, which it does not take because the reported CPU features select its software ciphers.
+- `--run [ARGS]` starts the lifted program with the hosted environment.
+
+The first build of each DLL is slow (a few minutes for PuTTY's 48 DLLs); later builds reuse them and take seconds.
+
+### 7. Shared Lifted Modules
+
+A lifted DLL is built once as its own shared library and reused by every program, instead of being linked into each one. A relocated DLL loads at an address derived from its file name, so the same library fits any program.
+
+- The store is `~/Library/Caches/arm64-recompiler/modules`; set `ARM64_RECOMPILER_MODULE_STORE` to move it.
+- At startup the runtime looks for each library in `ARM64_RECOMPILER_MODULE_DIR`, beside the program, in `../Frameworks`, then in the store.
+- `ARM64_RECOMPILER_STATIC_MODULES=1` or `ARM64_RECOMPILER_NO_CACHE=1` links the DLLs into the program instead.
+- A library is rebuilt when the DLL or the lifter changes, but not when only `console_runtime.c` changes. After a runtime change that alters what lifted code expects, clear the store.
+
+With shared modules the GUI fixture's binary is under 1 MB instead of 40 MB.
+
 ---
 
 ## Performance Milestone (Plink `-V`)
@@ -115,7 +166,7 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 - **TLS & Callbacks**: Parses PE `IMAGE_DIRECTORY_ENTRY_TLS` and executes TLS callback routines (`DLL_PROCESS_ATTACH`) before the program entry point.
 - **Fiber Local Storage (FLS)**: Full support for `FlsAlloc`, `FlsFree`, `FlsGetValue`, `FlsSetValue`, and `FlsGetValue2`.
 - **Memory & Protection**: Emulates bounded guest sections, heap (`HeapAlloc`, `HeapReAlloc`, `HeapFree`), and `VirtualProtect` (mapping Win32 page protections to POSIX `mprotect`).
-- **Synchronization**: Emulates critical sections (`InitializeCriticalSection`, `InitializeCriticalSectionAndSpinCount`, `EnterCriticalSection`, `LeaveCriticalSection`, `DeleteCriticalSection`).
+- **Synchronization**: Critical sections (`InitializeCriticalSection`, `InitializeCriticalSectionAndSpinCount`, `EnterCriticalSection`, `TryEnterCriticalSection`, `LeaveCriticalSection`, `DeleteCriticalSection`) are real locks: the owner is claimed with a compare-and-swap and contended threads wait.
 - **Dynamic API Sets**: Prefix-based routing in `LoadLibraryExW` / `GetModuleHandleW` for `api-ms-win-core-*` (fibers, synch, localization, datetime, processthreads, sysinfo).
 - **UCRT Stdio**: Implements `__acrt_iob_func` with standard stream `_iobuf` structures (`stdin`, `stdout`, `stderr`), `_errno`, `fwrite`, `fputs`, `fflush`, `fputc`, `putchar`, and `puts`.
 - **Environment & Process Setup**: Emulates `GetCommandLineW`, `CommandLineToArgvW`, `GetEnvironmentStringsW`, `GetModuleHandleW`, and `GetProcAddress`.
@@ -127,6 +178,9 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 | Binary | Startup Status | Current Frontier / Stopping Point |
 | --- | --- | --- |
 | **`plink.exe`** (0.83) | **Fully functional (`-V`)** | Prints `plink: Release 0.83` and exits 0 on attempt 0. |
+| **`plink.exe`** (0.83), hosted | **SSH command over the network** | Key exchange, public-key login, remote command and exit status 0 against OpenSSH, through lifted `ws2_32.dll`. |
+| **`putty.exe`** (0.83), hosted | **GUI runs: configuration dialog, raw and SSH sessions** | Not in the repository; see hosted mode above. Hardware-accelerated crypto paths are not lifted. |
+| **`taskmgr.exe`** (Wine 11.0), hosted | **GUI runs** | Tabs, list views and a live status bar on lifted `comctl32.dll`. |
 | **`gui_showcase.exe`** | **Fully functional (Hybrid GUI)** | Executes Win32 `MessageBoxA` natively on macOS, displaying alert and exiting 0. |
 | **`jq.exe`** (1.8.2) | Runs real jq workloads | Verified for stdin, file input, sorting, regex, and error handling. See the jq parity test above. |
 | **`rg.exe`** (14.1.1) | Completes a single-threaded recursive search via the launcher in diagnostic mode | Both expected matches and exit status agree with Wine using `--no-heading --sort path`. |
@@ -136,6 +190,16 @@ Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-
 ## 🔮 Future Roadmap: Hybrid Native AOT + GUI Thunking
 
 The long-term vision for this project is to expand beyond console utilities and run complex Windows software with **native Apple Silicon performance** without having to reimplement decades of Windows display infrastructure from scratch.
+
+### Status
+
+The GUI half of this plan now exists as hosted mode (see the quickstart). It goes one step further than thunking into Wine: Wine's Windows-side DLLs are lifted along with the program, and only Wine's unix-side syscall layer runs as native code. Current limits:
+
+- Wine's `wineserver` and its helper processes are still the x86-64 install's own, so they run under Rosetta, and a Wine prefix is required. There is no standalone `.app` bundle yet.
+- Every linked DLL is loaded at startup, used or not. PuTTY takes several seconds to show its window.
+- `DLL_THREAD_ATTACH` is not delivered to threads Wine creates.
+- Instruction coverage is still driven by the programs tried so far: AES-NI, SHA, carry-less multiply and AVX are not lifted.
+- Direct3D and the "Metal thunking" part of the diagram are not started.
 
 ### The Hybrid Architecture
 
