@@ -1,0 +1,7 @@
+winsock version 2
+connected
+sent 19
+select 1
+reply echo hello from winsock
+closesocket 0
+WSACleanup 0

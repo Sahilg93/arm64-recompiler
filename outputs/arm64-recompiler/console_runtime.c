@@ -18,25 +18,43 @@
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <malloc/malloc.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <sys/resource.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "console_modules.h"
 __attribute__((weak)) struct guest_module *guest_modules;
 __attribute__((weak)) const size_t guest_module_count = 0;
+/*
+ * Lifted DLLs built as shared libraries (build_console_modules.py): one file
+ * name per guest_modules entry, and the module store they were built into.
+ * NULL when the modules are linked into the program.
+ */
+__attribute__((weak)) const char *const *guest_module_libraries;
+__attribute__((weak)) const char *guest_module_store;
 extern const struct section guest_sections[];
 extern const uint64_t guest_section_count;
 static unsigned char **image;
 static uint32_t *section_protection;
 static _Thread_local void *current_cpu = NULL;
 void guest_set_cpu(void *cpu) { current_cpu = cpu; }
-#define GUEST_HEAP_TAG UINT64_C(0x1000000000000000)
+/*
+ * Guest memory is identity-mapped: a guest address is the host address of the
+ * same byte. macOS maps nothing below 4 GiB in an arm64 process, so smaller
+ * values are never memory (null, handles, call tokens, legacy bare RVAs).
+ */
+#define GUEST_HOST_FLOOR UINT64_C(0x100000000)
 extern const uint64_t guest_image_base;
 extern uint32_t lifted_console(void);
 
 void guest_init_critical(uint64_t address, uint32_t spin_count);
 void guest_critical_section(uint64_t address, uint32_t entering);
+static bool guest_try_critical_section(uint64_t address);
 uint64_t guest_virtual_protect(uint64_t address, uint64_t size, uint32_t new_protect, uint64_t old_protect_ptr);
 void *guest_pointer(uint64_t addr, uint32_t width);
 uint64_t guest_acrt_iob_func(uint32_t index);
@@ -120,30 +138,71 @@ __attribute__((weak)) const uint64_t guest_tls_index_va = 0;
 __attribute__((weak)) const uint64_t guest_tls_zero_fill = 0;
 
 enum {
-    STACK_BASE = 0x2000000, STACK_SIZE = 1048576,
-    TEB_BASE = 0x2101000, PEB_BASE = 0x2102000,
-    IOBUF_BASE = 0x2103000, IOBUF_ENTRY_SIZE = 48, IOBUF_COUNT = 3,
-    ERRNO_BASE = 0x2104000,
-    RUNTIME_DATA_BASE = 0x2105000, RUNTIME_DATA_SIZE = 4096,
-    ARGC_BASE = 0x2105000,
-    ARGV_BASE = 0x2105010,
-    WARGV_BASE = 0x2105020,
-    FMODE_BASE = 0x2105030,
-    COMMODE_BASE = 0x2105038,
-    WENVIRON_BASE = 0x2105040,
-    ENVIRON_BASE = 0x2105048,
-    TLS_BASE = 0x2106000, TLS_SIZE = 1048576
+    STACK_SIZE = 1048576,
+    IOBUF_ENTRY_SIZE = 48, IOBUF_COUNT = 3,
+    RUNTIME_DATA_SIZE = 4096,
+    TLS_SIZE = 1048576
 };
 /* Guest memory backed by host arrays: keep it 16-byte aligned so aligned guest
    accesses (including lifted atomics, which fault when misaligned) stay aligned. */
 static _Alignas(16) unsigned char stack[STACK_SIZE];
-static bool initialized[STACK_SIZE];
-static _Thread_local _Alignas(16) unsigned char teb[4096];
-static _Alignas(16) unsigned char peb[4096];
+/* Larger than a real TEB (0x1838 bytes): lifted ntdll writes fields such as LastStatusValue at 0x1250. */
+static _Thread_local _Alignas(16) unsigned char teb_storage[0x4000];
+static _Alignas(16) unsigned char peb_storage[4096];
+/*
+ * Hosted on Wine's unix side (ARM64_RECOMPILER_WINE_HOST, see wine-host/), the
+ * TEB and PEB are the ones Wine allocated: its native code and the lifted
+ * Windows code share them (thread info, last error, callback table).
+ */
+static bool wine_hosted;
+static _Thread_local unsigned char *host_teb;
+static unsigned char *host_peb;
+#define teb (host_teb ? host_teb : teb_storage)
+#define peb (host_peb ? host_peb : peb_storage)
 static _Alignas(16) unsigned char iobuf[IOBUF_COUNT * IOBUF_ENTRY_SIZE];
 static _Thread_local int guest_errno_storage;
 static _Alignas(16) unsigned char runtime_data[RUNTIME_DATA_SIZE];
 static _Thread_local _Alignas(16) unsigned char tls_storage[TLS_SIZE];
+/* These regions are identity-mapped: the guest address is the host address. */
+#define GUEST_ADDRESS(object) ((uint64_t)(uintptr_t)(object))
+#define STACK_BASE GUEST_ADDRESS(stack)
+#define TEB_BASE GUEST_ADDRESS(teb)
+#define PEB_BASE GUEST_ADDRESS(peb)
+#define IOBUF_BASE GUEST_ADDRESS(iobuf)
+#define ERRNO_BASE GUEST_ADDRESS(&guest_errno_storage)
+#define RUNTIME_DATA_BASE GUEST_ADDRESS(runtime_data)
+#define ARGC_BASE (RUNTIME_DATA_BASE + 0x00)
+#define ARGV_BASE (RUNTIME_DATA_BASE + 0x10)
+#define WARGV_BASE (RUNTIME_DATA_BASE + 0x20)
+#define FMODE_BASE (RUNTIME_DATA_BASE + 0x30)
+#define COMMODE_BASE (RUNTIME_DATA_BASE + 0x38)
+#define WENVIRON_BASE (RUNTIME_DATA_BASE + 0x40)
+#define ENVIRON_BASE (RUNTIME_DATA_BASE + 0x48)
+#define TLS_BASE GUEST_ADDRESS(tls_storage)
+/* Size of the primary image mapping at guest_image_base (set in main). */
+static uint64_t guest_image_span = 0x20000000;
+/* The primary image's range, for lifted code's inlined store fast path (console_lift.py). */
+extern const uint64_t guest_image_base;
+uint64_t guest_primary_base, guest_primary_span;
+
+/*
+ * Windows keeps its shared user data page at 0x7ffe0000 and lifted system code
+ * reads it there. Nothing can be mapped below 4 GiB, so hosted Wine keeps the
+ * page 4 GiB higher and the slow paths redirect to it.
+ */
+static inline uint64_t guest_low_alias(uint64_t addr) {
+    return wine_hosted && addr - UINT64_C(0x7ffe0000) < 0x1000 ? addr + UINT64_C(0x100000000) : addr;
+}
+
+/* True when addr is its own host pointer: at or above the host floor and outside
+   the primary image, whose accesses keep their per-section protection checks. */
+static inline bool guest_direct(uint64_t addr) {
+    return addr >= GUEST_HOST_FLOOR && addr - guest_image_base >= guest_image_span;
+}
+
+/* The current thread's TEB (the guest GS base) and the main thread's stack top. */
+uint64_t guest_teb(void) { return TEB_BASE; }
+uint64_t guest_initial_stack(void) { return STACK_BASE + STACK_SIZE; }
 
 static int host_argc;
 static char **host_argv;
@@ -207,7 +266,7 @@ static _Thread_local bool delivering_fault;
  * (writable), a load (store) that fits the section cannot fault and needs no
  * armed signal state. Bit i of image_read_fast / image_write_fast says
  * section i qualifies; guest_virtual_protect recomputes the bits from the
- * per-page host protection in image_page_prot, so a temporary VirtualProtect
+ * per-page guest protection in image_prot, so a temporary VirtualProtect
  * (MinGW's pseudo-relocator) only diverts the section to the faultable slow
  * path until its pages are restored. Anything the fast path declines
  * (straddling, unmapped, protected) takes the slow path unchanged.
@@ -216,16 +275,72 @@ static _Atomic uint64_t image_read_fast, image_write_fast;
 /* image_page_section[rva >> 12] is 1 + the section owning that 4 KiB page, or 0. */
 static uint8_t *image_page_section;
 static uint64_t image_page_limit;
-static int **image_page_prot;
-static size_t *image_page_count;
+/* image_prot[rva >> 12] is the POSIX protection of that 4 KiB guest page. */
+static uint8_t *image_prot;
+static uint64_t image_prot_pages;
 
-/* Recompute section i's fast-path bits from its host page protections. */
+/*
+ * Guest images are mapped at their own guest addresses, so a guest pointer
+ * into an image is also the host pointer. The range must be free in the host
+ * process; VM_FLAGS_FIXED fails instead of replacing an existing mapping.
+ */
+static unsigned char *guest_map_fixed(uint64_t base, uint64_t size) {
+    vm_size_t page = (vm_size_t)sysconf(_SC_PAGESIZE);
+    vm_address_t address = (vm_address_t)base;
+    vm_size_t length = ((vm_size_t)size + page - 1) & ~(page - 1);
+    if (!base || (base & (page - 1)) || !length ||
+        vm_allocate(mach_task_self(), &address, length, VM_FLAGS_FIXED) != KERN_SUCCESS)
+        return NULL;
+    return (unsigned char *)address;
+}
+
+static void guest_unmap_fixed_range(uint64_t base, uint64_t size);
+
+/*
+ * Replace an already claimed guest range with a private copy-on-write mapping
+ * of a page-aligned image held in the executable's data. Returns false (leaving
+ * the range as it was) when there is no such image or the kernel refuses.
+ */
+static bool guest_map_image_copy(uint64_t base, const unsigned char *source, uint64_t size) {
+    mach_vm_size_t page = (mach_vm_size_t)sysconf(_SC_PAGESIZE);
+    if (!source || ((uintptr_t)source & (page - 1)) || (base & (page - 1)))
+        return false;
+    mach_vm_address_t target = base;
+    vm_prot_t current, maximum;
+    kern_return_t result = mach_vm_remap(mach_task_self(), &target, (size + page - 1) & ~(page - 1), 0,
+                                         VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                         (mach_vm_address_t)(uintptr_t)source, TRUE, &current, &maximum,
+                                         VM_INHERIT_COPY);
+    if (result != KERN_SUCCESS)
+        return false;
+    if ((current & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE) &&
+        mprotect((void *)(uintptr_t)base, (size_t)((size + page - 1) & ~(page - 1)), PROT_READ | PROT_WRITE)) {
+        /* Unusable: put plain zero-filled memory back for the copying path. */
+        guest_unmap_fixed_range(base, size);
+        return false;
+    }
+    return true;
+}
+
+static void guest_unmap_fixed(uint64_t base, uint64_t size) {
+    vm_size_t page = (vm_size_t)sysconf(_SC_PAGESIZE);
+    vm_deallocate(mach_task_self(), (vm_address_t)base, ((vm_size_t)size + page - 1) & ~(page - 1));
+}
+
+static void guest_unmap_fixed_range(uint64_t base, uint64_t size) {
+    guest_unmap_fixed(base, size);
+    guest_map_fixed(base, size);
+}
+
+/* Recompute section i's fast-path bits from its guest page protections. */
 static void image_update_fast(uint64_t i, bool writable_section) {
     if (i >= 64)
         return;
     int all = PROT_READ | PROT_WRITE;
-    for (size_t page = 0; page < image_page_count[i]; ++page)
-        all &= image_page_prot[i][page];
+    uint64_t first = guest_sections[i].address >> 12;
+    uint64_t end = (guest_sections[i].address + guest_sections[i].size + 0xfff) >> 12;
+    for (uint64_t page = first; page < end && page < image_prot_pages; ++page)
+        all &= image_prot[page];
     uint64_t bit = UINT64_C(1) << i;
     if (all & PROT_READ)
         atomic_fetch_or(&image_read_fast, bit);
@@ -239,14 +354,14 @@ static void image_update_fast(uint64_t i, bool writable_section) {
 
 static inline __attribute__((always_inline)) unsigned char *image_fast_span(uint64_t addr, uint32_t width, bool write) {
     /* Lifted RIP-relative operands arrive as bare RVAs; guest pointers as VAs.
-       Like read_span, accept both, but take a bare RVA only below STACK_BASE so
-       the stack/TEB/PEB/TLS regions keep precedence. */
+       Like read_span, accept both. A bare RVA is below 4 GiB, where no host
+       (identity-mapped) address can be. */
     uint64_t rva = addr;
     if (guest_image_base && addr >= guest_image_base) {
         rva = addr - guest_image_base;
-        if (rva >= 0x20000000)
+        if (rva >= guest_image_span)
             return NULL;
-    } else if (addr >= STACK_BASE || !addr) {
+    } else if (addr >= UINT64_C(0x100000000) || !addr) {
         /* Address 0 is a null dereference: read_span raises the access violation. */
         return NULL;
     }
@@ -324,7 +439,7 @@ void guest_check_xcr(uint32_t index, uint64_t rva) {
  * access runs with guest_memory_access armed and records which host span
  * stands for which guest address. If the copy raises SIGSEGV or SIGBUS (a
  * PROT_NONE or read-only VirtualAlloc page, a read-only mapped view, a freed
- * tagged heap block), the handler runs on the alternate stack, translates the
+ * heap block), the handler runs on the alternate stack, translates the
  * host fault address back to the guest address, and returns into
  * guest_fault_trampoline. The trampoline runs on the faulting thread's normal
  * stack, outside signal context, and dispatches EXCEPTION_ACCESS_VIOLATION to
@@ -396,18 +511,83 @@ static __attribute__((noinline)) void guest_faultable_copy(void *destination,
     guest_memory_access = 0;
 }
 
+/*
+ * ARM64_RECOMPILER_TRACE_TIME=1: print elapsed and process CPU time at startup
+ * phases and around each module load, to see where launch time goes.
+ */
+static void trace_time(const char *what, const char *detail) {
+    static int enabled = -1;
+    static struct timespec origin;
+    if (enabled < 0) {
+        enabled = getenv("ARM64_RECOMPILER_TRACE_TIME") != NULL;
+        clock_gettime(CLOCK_MONOTONIC, &origin);
+    }
+    if (!enabled)
+        return;
+    struct timespec now;
+    struct rusage usage;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    getrusage(RUSAGE_SELF, &usage);
+    fprintf(stderr, "[time] %8.1f ms  user %7.1f sys %7.1f  %s%s%s\n",
+            (now.tv_sec - origin.tv_sec) * 1e3 + (now.tv_nsec - origin.tv_nsec) / 1e6,
+            usage.ru_utime.tv_sec * 1e3 + usage.ru_utime.tv_usec / 1e3,
+            usage.ru_stime.tv_sec * 1e3 + usage.ru_stime.tv_usec / 1e3, what, detail ? " " : "", detail ? detail : "");
+}
+
+/*
+ * ARM64_RECOMPILER_PROFILE_NAMES=1: count calls that reach the by-name system
+ * dispatcher and print the most frequent at exit. That path compares strings,
+ * so a name that is hot here wants a direct route.
+ */
+static struct { char name[64]; uint64_t count; } named_dispatch_counts[512];
+static void report_named_dispatch(void) {
+    for (int round = 0; round < 25; ++round) {
+        size_t best = 0;
+        for (size_t i = 1; i < 512; ++i)
+            if (named_dispatch_counts[i].count > named_dispatch_counts[best].count)
+                best = i;
+        if (!named_dispatch_counts[best].count)
+            break;
+        fprintf(stderr, "[names] %10llu %s\n", (unsigned long long)named_dispatch_counts[best].count,
+                named_dispatch_counts[best].name);
+        named_dispatch_counts[best].count = 0;
+    }
+}
+static void count_named_dispatch(const char *name) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("ARM64_RECOMPILER_PROFILE_NAMES") != NULL;
+        if (enabled)
+            atexit(report_named_dispatch);
+    }
+    if (!enabled)
+        return;
+    for (size_t i = 0; i < 512; ++i) {
+        if (!named_dispatch_counts[i].name[0])
+            snprintf(named_dispatch_counts[i].name, sizeof named_dispatch_counts[i].name, "%s", name);
+        if (!strcmp(named_dispatch_counts[i].name, name)) {
+            ++named_dispatch_counts[i].count;
+            return;
+        }
+    }
+}
+
+/* ARM64_RECOMPILER_WINE_DEBUG: print the debug messages of lifted Wine DLLs. */
+static bool wine_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ARM64_RECOMPILER_WINE_DEBUG") != NULL;
+    return enabled;
+}
+
 static void fault(void) {
     fprintf(stderr, "RVA %#llx: unsupported guest memory access\n", (unsigned long long)guest_pc);
     exit(125);
 }
 
-unsigned char *subsys_mapping_span(uint64_t addr, uint64_t size);
-
-static inline unsigned char *heap_span(uint64_t address, uint64_t size) {
-    (void)size;
-    if ((address & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG)
-        return (unsigned char *)(uintptr_t)(address & ~UINT64_C(0xFF00000000000000));
-    return subsys_mapping_span(address, size);
+/* True for a live block from the host allocator, which backs every guest heap. */
+static bool guest_heap_block(uint64_t address) {
+    return address >= GUEST_HOST_FLOOR && malloc_size((void *)(uintptr_t)address) != 0;
 }
 
 /*
@@ -432,13 +612,13 @@ uint64_t guest_heap_alloc(uint64_t handle, uint32_t flags, uint64_t size) {
     void *data = (flags & 8u) ? calloc(size, 1) : malloc(size);
     if (!data)
         return 0;
-    return GUEST_HEAP_TAG | (uint64_t)(uintptr_t)data;
+    return (uint64_t)(uintptr_t)data;
 }
 
 uint64_t guest_heap_free(uint64_t handle, uint32_t flags, uint64_t address) {
     (void)handle; (void)flags;
-    if (address && (address & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
-        free((void *)(uintptr_t)(address & ~UINT64_C(0xFF00000000000000)));
+    if (guest_heap_block(address)) {
+        free((void *)(uintptr_t)address);
         return 1;
     }
     return 0;
@@ -447,13 +627,13 @@ uint64_t guest_heap_free(uint64_t handle, uint32_t flags, uint64_t address) {
 uint64_t guest_heap_realloc(uint64_t handle, uint32_t flags, uint64_t address, uint64_t size) {
     if (!address)
         return guest_heap_alloc(handle, flags, size);
-    if ((address & UINT64_C(0xFF00000000000000)) != GUEST_HEAP_TAG)
+    if (!guest_heap_block(address))
         return 0;
-    void *old_ptr = (void *)(uintptr_t)(address & ~UINT64_C(0xFF00000000000000));
+    void *old_ptr = (void *)(uintptr_t)address;
     void *new_ptr = realloc(old_ptr, size ? size : 1);
     if (!new_ptr)
         return 0;
-    return GUEST_HEAP_TAG | (uint64_t)(uintptr_t)new_ptr;
+    return (uint64_t)(uintptr_t)new_ptr;
 }
 
 struct translated_module {
@@ -496,42 +676,17 @@ static __attribute__((noinline, cold)) void read_span_null(void) {
 }
 
 static const unsigned char *read_span(uint64_t addr, uint64_t size) {
+    addr = guest_low_alias(addr);
     uint64_t original = addr;
     if (__builtin_expect(!addr, 0))
         read_span_null();
-    if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG)
-        return (const unsigned char *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
-    if (fits(addr, size, STACK_BASE, STACK_SIZE)) {
-        uint64_t offset = addr - STACK_BASE;
-        return stack + offset;
-    }
-    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
+    if (guest_direct(addr))
+        return (const unsigned char *)(uintptr_t)addr;
+    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < guest_image_span)
         addr -= guest_image_base;
-    if (fits(addr, size, TEB_BASE, sizeof teb))
-        return teb + (addr - TEB_BASE);
-    if (fits(addr, size, PEB_BASE, sizeof peb))
-        return peb + (addr - PEB_BASE);
-    if (fits(addr, size, IOBUF_BASE, sizeof iobuf))
-        return iobuf + (addr - IOBUF_BASE);
-    if (fits(addr, size, ERRNO_BASE, sizeof guest_errno_storage))
-        return (const unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE);
-    if (fits(addr, size, RUNTIME_DATA_BASE, sizeof runtime_data))
-        return runtime_data + (addr - RUNTIME_DATA_BASE);
-    if (fits(addr, size, TEB_BASE, sizeof teb))
-        return teb + (addr - TEB_BASE);
-    if (fits(addr, size, PEB_BASE, sizeof peb))
-        return peb + (addr - PEB_BASE);
-    if (fits(addr, size, TLS_BASE, sizeof tls_storage))
-        return tls_storage + (addr - TLS_BASE);
     for (uint64_t i = 0; i < guest_section_count; ++i)
         if (fits(addr, size, guest_sections[i].address, guest_sections[i].size))
             return image[i] + (addr - guest_sections[i].address);
-    unsigned char *module = module_span(addr, size, false);
-    if (module)
-        return module;
-    unsigned char *heap = heap_span(addr, size);
-    if (heap)
-        return heap;
     if (guest_fault_pc && current_cpu && !delivering_fault)
         guest_access_violation(original, false);
     fprintf(stderr, "read address %#llx size %llu\n", (unsigned long long)addr, (unsigned long long)size);
@@ -552,24 +707,24 @@ uint64_t guest_load_slow(uint64_t addr, uint32_t width) {
 }
 
 __attribute__((always_inline)) uint64_t guest_load(uint64_t addr, uint32_t width) {
-    if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
-        uint64_t val = 0;
-        const void *source = (const void *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
-        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
-            guest_faultable_copy(&val, source, width, addr, false);
-        else
-            memcpy(&val, source, width);
-        return val;
-    }
     if (fits(addr, width, STACK_BASE, STACK_SIZE)) {
         uint64_t val = 0;
-        memcpy(&val, stack + (addr - STACK_BASE), width);
+        memcpy(&val, (const void *)(uintptr_t)addr, width);
         return val;
     }
     const unsigned char *section = image_fast_span(addr, width, false);
     if (section) {
         uint64_t val = 0;
         memcpy(&val, section, width);
+        return val;
+    }
+    if (guest_direct(addr)) {
+        uint64_t val = 0;
+        const void *source = (const void *)(uintptr_t)addr;
+        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
+            guest_faultable_copy(&val, source, width, addr, false);
+        else
+            memcpy(&val, source, width);
         return val;
     }
     return guest_load_slow(addr, width);
@@ -602,13 +757,17 @@ static const struct { uint64_t module; const char *name; } service_exports[] = {
     {WINSOCK_MODULE, "shutdown"}, {WINSOCK_MODULE, "send"}, {WINSOCK_MODULE, "recv"},
 };
 
+static bool is_lifted_system_dll(const char *resolved);
+
 static uint64_t service_module(const char *name) {
     static const char *const names[] = {"bcrypt", "advapi32", "ws2_32"};
+    static const char *const files[] = {"bcrypt.dll", "advapi32.dll", "ws2_32.dll"};
     for (size_t i = 0; i < sizeof names / sizeof *names; ++i) {
         size_t length = strlen(names[i]);
         if (!strncasecmp(name, names[i], length) &&
             (!name[length] || !strcasecmp(name + length, ".dll")))
-            return BCRYPT_MODULE + i;
+            /* The program's own lifted copy of the DLL replaces the runtime's shims. */
+            return is_lifted_system_dll(files[i]) ? 0 : BCRYPT_MODULE + i;
     }
     return 0;
 }
@@ -627,13 +786,27 @@ static void module_string(char *text, size_t capacity, uint64_t address, unsigne
     guest_trap("unterminated module or procedure name");
 }
 
+/*
+ * A module named by a full path ("C:\\windows\\system32\\comctl32.dll", as Wine's
+ * user32 names comctl32, or a DLL beside the program) is the module of that
+ * file name: lifted modules have no directory of their own.
+ */
+static const char *system_module_name(const char *name) {
+    if (!name[0] || (name[1] != ':' && name[0] != '\\'))
+        return name;
+    const char *slash = strrchr(name, '\\'), *forward = strrchr(name, '/');
+    if (forward && (!slash || forward > slash))
+        slash = forward;
+    return slash && slash[1] ? slash + 1 : name;
+}
+
 static bool is_lifted_system_dll(const char *resolved);
 
 /* A loaded (referenced) application module by file name, or NULL. */
 static struct guest_module *loaded_module_named(const char *name) {
     char buffer[160];
     const char *dot = strrchr(name, '.');
-    if (!dot || strcasecmp(dot, ".dll")) {
+    if (!dot || (strcasecmp(dot, ".dll") && strcasecmp(dot, ".drv"))) {
         snprintf(buffer, sizeof buffer, "%s.dll", name);
         name = buffer;
     }
@@ -647,11 +820,12 @@ static struct guest_module *loaded_module_named(const char *name) {
 }
 
 static bool is_kernel_module_name(const char *name) {
-    for (unsigned i = 0; i < 2; ++i) {
-        const char *base = i ? "kernelbase" : "ntdll";
-        size_t n = strlen(base);
-        if (!strncasecmp(name, base, n) && (!name[n] || !strcasecmp(name + n, ".dll")) &&
-            is_lifted_system_dll(i ? "kernelbase.dll" : "ntdll.dll"))
+    static const char *const liftable[][2] = {
+        {"ntdll", "ntdll.dll"}, {"kernelbase", "kernelbase.dll"}, {"kernel32", "kernel32.dll"}};
+    for (unsigned i = 0; i < sizeof liftable / sizeof *liftable; ++i) {
+        size_t n = strlen(liftable[i][0]);
+        if (!strncasecmp(name, liftable[i][0], n) && (!name[n] || !strcasecmp(name + n, ".dll")) &&
+            is_lifted_system_dll(liftable[i][1]))
             return false;
     }
     const char *modules[] = {"kernel32", "kernelbase", "ntdll"};
@@ -679,8 +853,20 @@ static bool is_kernel_module_name(const char *name) {
 uint64_t guest_module_handle(uint64_t address, uint32_t wide) {
     if (!address)
         return guest_image_base;
-    char name[129];
-    module_string(name, sizeof name, address, wide ? 2 : 1);
+    char text[520];
+    module_string(text, sizeof text, address, wide ? 2 : 1);
+    const char *name = system_module_name(text);
+    /* The program itself, named by its path. */
+    if (name != text && host_peb) {
+        uint64_t parameters = guest_load((uint64_t)(uintptr_t)host_peb + 0x20, 8);
+        uint64_t bytes = guest_load(parameters + 0x60, 2), image = guest_load(parameters + 0x68, 8);
+        size_t length = strlen(name);
+        bool same = bytes / 2 >= length;
+        for (size_t i = 0; same && i < length; ++i)
+            same = tolower((int)guest_load(image + bytes - 2 * (length - i), 2)) == tolower((unsigned char)name[i]);
+        if (same && (bytes / 2 == length || guest_load(image + bytes - 2 * length - 2, 2) == '\\'))
+            return guest_image_base;
+    }
     uint64_t service = service_module(name);
     if (service && service_references[service - BCRYPT_MODULE])
         return service;
@@ -716,13 +902,23 @@ static struct guest_module *find_guest_module(uint64_t handle) {
     return NULL;
 }
 
+/* Bumped when a module's code goes away; see guest_lookup_dispatch. */
+static _Atomic uint64_t dispatch_generation = 1;
+
 static void unmap_guest_module(struct guest_module *module) {
-    for (size_t i = 0; i < module->section_count; ++i)
-        free(module->memory[i]);
+    atomic_fetch_add(&dispatch_generation, 1);
+    if (module->memory) {
+        guest_unmap_fixed(module->base, module->size);
+        /* A linked-in module keeps its address range for the next load. */
+        if (module >= guest_modules && module < guest_modules + guest_module_count)
+            guest_map_fixed(module->base, module->size);
+    }
     free(module->memory);
     module->memory = NULL;
     module->references = 0;
 }
+
+static uint64_t wine_host_unix_call(uint64_t handle, uint32_t code, uint64_t args);
 
 static void init_guest_cpu(uint64_t *cpu) {
     // The low byte of each width slot describes the initialized register.
@@ -788,7 +984,7 @@ static const char *resolve_api_set(const char *name, char *buffer, size_t size) 
         if (!strncasecmp(name, system_prefixes[i], strlen(system_prefixes[i])))
             return "kernelbase.dll";
     const char *dot = strrchr(name, '.');
-    if (!dot || strcasecmp(dot, ".dll")) {
+    if (!dot || (strcasecmp(dot, ".dll") && strcasecmp(dot, ".drv"))) {
         snprintf(buffer, size, "%s.dll", name);
         return buffer;
     }
@@ -801,26 +997,31 @@ static const char *resolve_api_set(const char *name, char *buffer, size_t size) 
  * that name, or with on-demand translation, the file beside the program.
  */
 static bool is_lifted_system_dll(const char *resolved) {
-    static const char *const liftable[] = {"ntdll.dll", "kernelbase.dll"};
-    static _Atomic int cache[2] = {-1, -1};
+    /* Keep in sync with LIFTABLE_SYSTEM_DLLS in build_console_modules.py. */
+    static const char *const liftable[] = {"ntdll.dll", "kernelbase.dll", "user32.dll", "gdi32.dll",
+                                           "win32u.dll", "kernel32.dll", "advapi32.dll", "sechost.dll",
+                                           "shell32.dll", "shlwapi.dll", "ole32.dll",
+                                           "ws2_32.dll", "oleaut32.dll", "userenv.dll"};
+    enum { LIFTABLE = sizeof liftable / sizeof *liftable };
+    static _Atomic int cache[LIFTABLE]; /* 0: unknown, 1: shim, 2: lifted */
     size_t index = 0;
-    while (index < 2 && strcasecmp(resolved, liftable[index]))
+    while (index < LIFTABLE && strcasecmp(resolved, liftable[index]))
         ++index;
-    if (index == 2)
+    if (index == LIFTABLE)
         return false;
     _Atomic int *cached = &cache[index];
     int state = atomic_load(cached);
-    if (state < 0) {
-        state = 0;
+    if (!state) {
+        state = 1;
         for (size_t i = 0; i < guest_module_count; ++i)
             if (!strcasecmp(guest_modules[i].name, resolved))
-                state = 1;
+                state = 2;
         struct stat info;
-        if (!state && getenv("ARM64_RECOMPILER_PYTHON") && !stat(resolved, &info) && S_ISREG(info.st_mode))
-            state = 1;
+        if (state == 1 && getenv("ARM64_RECOMPILER_PYTHON") && !stat(resolved, &info) && S_ISREG(info.st_mode))
+            state = 2;
         atomic_store(cached, state);
     }
-    return state;
+    return state == 2;
 }
 
 /* DLLs the runtime implements with named shims (keep in sync with build_console_modules.py). */
@@ -967,6 +1168,12 @@ static uint64_t call_guest_function(uint64_t target, uint64_t a, uint64_t b, uin
  * same through ntdll's own exports once the lifted ntdll.dll is loaded.
  */
 static void init_lifted_ntdll(struct guest_module *module) {
+    if (wine_hosted) {
+        /* Lifted DLLs reach their unix libraries by calling through this ntdll variable. */
+        uint64_t slot = module_export(module, "__wine_unix_call_dispatcher", 0);
+        if (slot)
+            guest_store(slot, system_thunk("__wine_unix_call_dispatcher"), 8);
+    }
     uint64_t size, ansi = nls_file("c_1252.nls", &size), oem = nls_file("c_437.nls", &size);
     uint64_t casemap = nls_file("l_intl.nls", &size);
     uint64_t init = module_export(module, "RtlInitNlsTables", 0);
@@ -982,45 +1189,63 @@ static void init_lifted_ntdll(struct guest_module *module) {
 }
 
 static uint64_t load_guest_module(struct guest_module *module, const char *path) {
+    /* Already loaded: take a reference. This is by far the common call. */
+    if (module->references) {
+        ++module->references;
+        return module->base;
+    }
+    trace_time("load begin", module->name);
+    /* The DLL beside the program must be the one that was lifted. */
     FILE *file = fopen(path, "rb");
     if (!file) {
         last_error = 126;
         return 0;
     }
-    unsigned char buffer[4096];
-    size_t offset = 0;
-    while (offset < module->file_size) {
-        size_t remaining = module->file_size - offset;
-        size_t count = remaining < sizeof buffer ? remaining : sizeof buffer;
-        if (fread(buffer, 1, count, file) != count ||
-            memcmp(buffer, module->file + offset, count) != 0)
-            break;
-        offset += count;
+    unsigned char buffer[65536], digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_CTX hash;
+    CC_SHA256_Init(&hash);
+    size_t total = 0, count;
+    while ((count = fread(buffer, 1, sizeof buffer, file)) > 0) {
+        CC_SHA256_Update(&hash, buffer, (CC_LONG)count);
+        total += count;
     }
-    bool matches = offset == module->file_size && fgetc(file) == EOF && !ferror(file);
+    CC_SHA256_Final(digest, &hash);
+    bool matches = total == module->file_size && !ferror(file) &&
+                   !memcmp(digest, module->file_hash, sizeof digest);
     fclose(file);
     if (!matches) {
         last_error = 193;
         return 0;
-    }
-    if (module->references) {
-        ++module->references;
-        return module->base;
     }
     module->memory = calloc(module->section_count, sizeof *module->memory);
     if (!module->memory) {
         last_error = 8;
         return 0;
     }
+    bool placed = true;
+    for (size_t i = 0; i < module->section_count; ++i)
+        placed = placed && fits(module->sections[i].address, module->sections[i].size,
+                                module->base, module->size);
+    /* Linked-in modules were reserved at startup (reserve_guest_modules). */
+    bool reserved = module >= guest_modules && module < guest_modules + guest_module_count;
+    unsigned char *mapping = !placed ? NULL
+        : reserved ? (unsigned char *)(uintptr_t)module->base
+        : guest_map_fixed(module->base, module->size);
+    if (!mapping) {
+        fprintf(stderr, "cannot map %s at guest address %#llx\n", module->name,
+                (unsigned long long)module->base);
+        free(module->memory);
+        module->memory = NULL;
+        last_error = 8;
+        return 0;
+    }
+    /* Map the image copy-on-write from the executable when it carries one; pages
+       the program never writes stay shared with the file instead of being copied. */
+    bool shared = guest_map_image_copy(module->base, module->image, module->size);
     for (size_t i = 0; i < module->section_count; ++i) {
         const struct section *section = &module->sections[i];
-        module->memory[i] = calloc(1, section->size);
-        if (!module->memory[i]) {
-            unmap_guest_module(module);
-            last_error = 8;
-            return 0;
-        }
-        if (section->initial_size)
+        module->memory[i] = mapping + (section->address - module->base);
+        if (!shared && section->initial_size)
             memcpy(module->memory[i], section->initial, section->initial_size);
     }
     module->references = 1;
@@ -1046,6 +1271,9 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
             }
             unsigned char *slot = mapped_module_span(module, import->slot, sizeof target, false);
             if (!target || !slot) {
+                if (getenv("ARM64_RECOMPILER_TRACE_IMPORTS"))
+                    fprintf(stderr, "[load] %s: unresolved import %s!%s (#%llu)\n", module->name, import->dll,
+                            import->name ? import->name : "", (unsigned long long)import->ordinal);
                 last_error = 127;
                 goto fail;
             }
@@ -1054,6 +1282,7 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
     }
     if (!strcasecmp(module->name, "ntdll.dll") && is_lifted_system_dll("ntdll.dll"))
         init_lifted_ntdll(module);
+    trace_time("imports bound, calling DllMain", module->name);
     if (!call_module_entry(module, 1)) {
         last_error = 1114;
         goto fail;
@@ -1061,10 +1290,13 @@ static uint64_t load_guest_module(struct guest_module *module, const char *path)
     if (attached_module_count < sizeof attached_modules / sizeof *attached_modules)
         attached_modules[attached_module_count++] = module;
     module->loading = false;
+    trace_time("load done", module->name);
     return module->base;
 
 fail: {
     uint32_t error = last_error;
+    if (getenv("ARM64_RECOMPILER_TRACE_IMPORTS"))
+        fprintf(stderr, "[load] %s failed, error %u\n", module->name, error);
     module->loading = false;
     unmap_guest_module(module);
     if (module->dependencies)
@@ -1215,9 +1447,15 @@ static uint64_t load_application_module(const char *name) {
         if (!module)
             return 0;
     }
-    if (!module || module->loading) {
+    if (!module) {
         last_error = 126;
         return 0;
+    }
+    /* A cycle (user32 <-> gdi32): the module is mapped and its exports resolve;
+       it finishes initializing when the outer load returns, as on Windows. */
+    if (module->loading && module->memory) {
+        ++module->references;
+        return module->base;
     }
     return load_guest_module(module, module->name);
 }
@@ -1377,19 +1615,15 @@ static uint64_t load_named_module(const char *module, uint64_t reserved, uint32_
 }
 
 uint64_t guest_load_library(uint64_t address, uint64_t reserved, uint32_t flags) {
-    char module[129];
+    char module[520];
     module_string(module, sizeof module, address, 2);
-    return load_named_module(module, reserved, flags);
+    return load_named_module(system_module_name(module), reserved, flags);
 }
 
 uint64_t guest_load_library_a(uint64_t address) {
-    char module[129];
+    char module[520];
     module_string(module, sizeof module, address, 1);
-    static const char system[] = "C:\\Windows\\System32\\";
-    const char *name = module;
-    if (strncasecmp(module, system, sizeof system - 1) == 0)
-        name += sizeof system - 1;
-    return load_named_module(name, 0, 0);
+    return load_named_module(system_module_name(module), 0, 0);
 }
 
 uint64_t guest_free_library(uint64_t handle) {
@@ -1511,132 +1745,74 @@ void guest_stack_smash_trap(uint64_t return_va) {
 void *guest_pointer(uint64_t addr, uint32_t width) {
     if (!width || width > sizeof(uint64_t))
         fault();
-    if (fits(addr, width, IOBUF_BASE, sizeof iobuf))
-        return iobuf + (addr - IOBUF_BASE);
-    if (fits(addr, width, ERRNO_BASE, sizeof guest_errno_storage))
-        return (unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE);
-    if (fits(addr, width, RUNTIME_DATA_BASE, sizeof runtime_data))
-        return runtime_data + (addr - RUNTIME_DATA_BASE);
-    if (fits(addr, width, TLS_BASE, sizeof tls_storage))
-        return tls_storage + (addr - TLS_BASE);
-    if (!fits(addr, width, STACK_BASE, STACK_SIZE)) {
-        if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
-            addr -= guest_image_base;
-        for (uint64_t i = 0; i < guest_section_count; ++i) {
-            const struct section *section = &guest_sections[i];
-            if (fits(addr, width, section->address, section->size))
-                return image[i] + (addr - section->address);
-        }
-        unsigned char *module = module_span(addr, width, false);
-        if (module)
-            return module;
-        unsigned char *heap = heap_span(addr, width);
-        if (!heap) {
-            fprintf(stderr, "address %#llx size %u\n", (unsigned long long)addr, width);
-            fault();
-        }
-        return heap;
+    addr = guest_low_alias(addr);
+    if (guest_direct(addr))
+        return (void *)(uintptr_t)addr;
+    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < guest_image_span)
+        addr -= guest_image_base;
+    for (uint64_t i = 0; i < guest_section_count; ++i) {
+        const struct section *section = &guest_sections[i];
+        if (fits(addr, width, section->address, section->size))
+            return image[i] + (addr - section->address);
     }
-    uint64_t offset = addr - STACK_BASE;
-    for (uint32_t i = 0; i < width; ++i)
-        initialized[offset + i] = true;
-    return stack + offset;
+    fprintf(stderr, "address %#llx size %u\n", (unsigned long long)addr, width);
+    fault();
+    return NULL;
 }
 
 void guest_store_slow(uint64_t addr, uint64_t value, uint32_t width) {
+    addr = guest_low_alias(addr);
     uint64_t original = addr;
     if (!width || width > sizeof value)
         fault();
-    if (fits(addr, width, TEB_BASE, sizeof teb)) {
-        memcpy(teb + (addr - TEB_BASE), &value, width);
-        return;
-    }
-    if (fits(addr, width, PEB_BASE, sizeof peb)) {
-        memcpy(peb + (addr - PEB_BASE), &value, width);
-        return;
-    }
-    if (fits(addr, width, IOBUF_BASE, sizeof iobuf)) {
-        memcpy(iobuf + (addr - IOBUF_BASE), &value, width);
-        return;
-    }
-    if (fits(addr, width, ERRNO_BASE, sizeof guest_errno_storage)) {
-        memcpy((unsigned char *)&guest_errno_storage + (addr - ERRNO_BASE), &value, width);
-        return;
-    }
-    if (fits(addr, width, RUNTIME_DATA_BASE, sizeof runtime_data)) {
-        memcpy(runtime_data + (addr - RUNTIME_DATA_BASE), &value, width);
-        return;
-    }
-    if (fits(addr, width, TLS_BASE, sizeof tls_storage)) {
-        memcpy(tls_storage + (addr - TLS_BASE), &value, width);
-        return;
-    }
-    if (!fits(addr, width, STACK_BASE, STACK_SIZE)) {
-        if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
-            addr -= guest_image_base;
-        for (uint64_t i = 0; i < guest_section_count; ++i) {
-            const struct section *section = &guest_sections[i];
-            bool writable = section_protection ? ((section_protection[i] & 0xcc) != 0) : section->writable;
-            if (writable && fits(addr, width, section->address, section->size)) {
-                memcpy(image[i] + (addr - section->address), &value, width);
-                return;
-            }
-        }
-        unsigned char *module = module_span(addr, width, true);
-        if (module) {
-            memcpy(module, &value, width);
-            return;
-        }
-        unsigned char *heap = heap_span(addr, width);
-        if (!heap) {
-            if (guest_fault_pc && current_cpu && !delivering_fault)
-                guest_access_violation(original, true);
-            fprintf(stderr, "write address %#llx size %u value %#llx\n", (unsigned long long)addr, width, (unsigned long long)value);
-            Dl_info dlinf;
-            if (dladdr(__builtin_return_address(0), &dlinf) && dlinf.dli_sname) {
-                fprintf(stderr, "Called from native symbol: %s (+%td)\n", dlinf.dli_sname, (char*)__builtin_return_address(0) - (char*)dlinf.dli_saddr);
-            }
-            if (current_cpu) {
-                uint64_t *regs = (uint64_t *)current_cpu;
-                fprintf(stderr, "guest RAX=%#llx RCX=%#llx RDX=%#llx RBX=%#llx RSP=%#llx RBP=%#llx RSI=%#llx RDI=%#llx\n",
-                    regs[0], regs[1], regs[2], regs[8], regs[7], regs[9], regs[10], regs[11]);
-                fprintf(stderr, "guest stack dump:\n");
-                for (int i = 0; i < 64; ++i) {
-                    uint64_t val = guest_load(regs[7] + i * 8, 8);
-                    if (val >= guest_image_base && val < guest_image_base + 0x500000) {
-                        fprintf(stderr, "  [rsp + %d]: %#llx (RVA %#llx)\n", i * 8, (unsigned long long)val, (unsigned long long)(val - guest_image_base));
-                    } else if (val >= 0x140000000ULL && val < 0x140500000ULL) {
-                        fprintf(stderr, "  [rsp + %d]: %#llx (RVA %#llx)\n", i * 8, (unsigned long long)val, (unsigned long long)(val - 0x140000000ULL));
-                    } else {
-                        fprintf(stderr, "  [rsp + %d]: %#llx\n", i * 8, (unsigned long long)val);
-                    }
-                }
-            }
-            fault();
-        }
-        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
-            guest_faultable_copy(heap, &value, width, original, true);
-        else
-            memcpy(heap, &value, width);
-        return;
-    }
-    uint64_t offset = addr - STACK_BASE;
-    memcpy(stack + offset, &value, width);
-    for (uint32_t i = 0; i < width; ++i)
-        initialized[offset + i] = true;
-}
-
-__attribute__((always_inline)) void guest_store(uint64_t addr, uint64_t value, uint32_t width) {
-    if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
-        void *destination = (void *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
+    if (guest_direct(addr)) {
+        void *destination = (void *)(uintptr_t)addr;
         if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
             guest_faultable_copy(destination, &value, width, addr, true);
         else
             memcpy(destination, &value, width);
         return;
     }
+    /* The primary image (as a VA or a bare RVA): honor the section protection. */
+    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < guest_image_span)
+        addr -= guest_image_base;
+    for (uint64_t i = 0; i < guest_section_count; ++i) {
+        const struct section *section = &guest_sections[i];
+        bool writable = section_protection ? ((section_protection[i] & 0xcc) != 0) : section->writable;
+        if (writable && fits(addr, width, section->address, section->size)) {
+            memcpy(image[i] + (addr - section->address), &value, width);
+            return;
+        }
+    }
+    if (guest_fault_pc && current_cpu && !delivering_fault)
+        guest_access_violation(original, true);
+    fprintf(stderr, "write address %#llx size %u value %#llx\n", (unsigned long long)addr, width, (unsigned long long)value);
+    Dl_info dlinf;
+    if (dladdr(__builtin_return_address(0), &dlinf) && dlinf.dli_sname) {
+        fprintf(stderr, "Called from native symbol: %s (+%td)\n", dlinf.dli_sname, (char*)__builtin_return_address(0) - (char*)dlinf.dli_saddr);
+    }
+    if (current_cpu) {
+        uint64_t *regs = (uint64_t *)current_cpu;
+        fprintf(stderr, "guest RAX=%#llx RCX=%#llx RDX=%#llx RBX=%#llx RSP=%#llx RBP=%#llx RSI=%#llx RDI=%#llx\n",
+            regs[0], regs[1], regs[2], regs[8], regs[7], regs[9], regs[10], regs[11]);
+        fprintf(stderr, "guest stack dump:\n");
+        for (int i = 0; i < 64; ++i) {
+            uint64_t val = guest_load(regs[7] + i * 8, 8);
+            if (val >= guest_image_base && val < guest_image_base + 0x500000) {
+                fprintf(stderr, "  [rsp + %d]: %#llx (RVA %#llx)\n", i * 8, (unsigned long long)val, (unsigned long long)(val - guest_image_base));
+            } else if (val >= 0x140000000ULL && val < 0x140500000ULL) {
+                fprintf(stderr, "  [rsp + %d]: %#llx (RVA %#llx)\n", i * 8, (unsigned long long)val, (unsigned long long)(val - 0x140000000ULL));
+            } else {
+                fprintf(stderr, "  [rsp + %d]: %#llx\n", i * 8, (unsigned long long)val);
+            }
+        }
+    }
+    fault();
+}
+
+__attribute__((always_inline)) void guest_store(uint64_t addr, uint64_t value, uint32_t width) {
     if (fits(addr, width, STACK_BASE, STACK_SIZE)) {
-        memcpy(stack + (addr - STACK_BASE), &value, width);
+        memcpy((void *)(uintptr_t)addr, &value, width);
         return;
     }
     unsigned char *section = image_fast_span(addr, width, true);
@@ -1891,25 +2067,10 @@ uint64_t guest_set_new_mode(uint32_t mode) {
 }
 
 unsigned char *guest_writable_span(uint64_t addr, uint64_t size) {
-    if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG)
-        return (unsigned char *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
-    if (fits(addr, size, STACK_BASE, STACK_SIZE)) {
-        uint64_t offset = addr - STACK_BASE;
-        for (uint64_t i = 0; i < size; ++i)
-            initialized[offset + i] = true;
-        return stack + offset;
-    }
-    if (fits(addr, size, TEB_BASE, sizeof teb))
-        return teb + (addr - TEB_BASE);
-    if (fits(addr, size, PEB_BASE, sizeof peb))
-        return peb + (addr - PEB_BASE);
-    if (fits(addr, size, TLS_BASE, sizeof tls_storage))
-        return tls_storage + (addr - TLS_BASE);
-    if (fits(addr, size, RUNTIME_DATA_BASE, sizeof runtime_data))
-        return runtime_data + (addr - RUNTIME_DATA_BASE);
-    if (fits(addr, size, IOBUF_BASE, sizeof iobuf))
-        return iobuf + (addr - IOBUF_BASE);
-    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < 0x20000000)
+    addr = guest_low_alias(addr);
+    if (guest_direct(addr))
+        return (unsigned char *)(uintptr_t)addr;
+    if (guest_image_base && addr >= guest_image_base && addr - guest_image_base < guest_image_span)
         addr -= guest_image_base;
     for (uint64_t i = 0; i < guest_section_count; ++i) {
         const struct section *sec = &guest_sections[i];
@@ -1917,10 +2078,7 @@ unsigned char *guest_writable_span(uint64_t addr, uint64_t size) {
         if (writable && fits(addr, size, sec->address, sec->size))
             return image[i] + (addr - sec->address);
     }
-    unsigned char *module = module_span(addr, size, true);
-    if (module)
-        return module;
-    return heap_span(addr, size);
+    return NULL;
 }
 
 uint64_t guest_wcslen(uint64_t str) {
@@ -2156,6 +2314,28 @@ uint64_t guest_packuswb(uint64_t low, uint64_t high) {
     return packed;
 }
 
+/* packsswb: eight signed words to signed-saturated bytes. */
+uint64_t guest_packsswb(uint64_t low, uint64_t high) {
+    uint64_t packed = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        int16_t word = (int16_t)((i < 4 ? low : high) >> ((i % 4) * 16));
+        int byte = word < -128 ? -128 : word > 127 ? 127 : word;
+        packed |= (uint64_t)(uint8_t)byte << (i * 8);
+    }
+    return packed;
+}
+
+/* packssdw: four signed doublewords to signed-saturated words. */
+uint64_t guest_packssdw(uint64_t low, uint64_t high) {
+    uint64_t packed = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        int32_t value = (int32_t)((i < 2 ? low : high) >> ((i % 2) * 32));
+        int word = value < -32768 ? -32768 : value > 32767 ? 32767 : value;
+        packed |= (uint64_t)(uint16_t)word << (i * 16);
+    }
+    return packed;
+}
+
 uint64_t guest_shuffle(uint64_t low, uint64_t high, uint64_t other,
                        uint32_t operation, uint32_t control, uint32_t lane) {
     uint64_t result = 0;
@@ -2178,6 +2358,19 @@ uint64_t guest_shuffle(uint64_t low, uint64_t high, uint64_t other,
         }
     }
     return result;
+}
+
+/* pshufb: eight result bytes selected from the 16-byte table by one half of the mask. */
+uint64_t guest_pshufb(uint64_t low, uint64_t high, uint64_t mask) {
+    unsigned char table[16], control[8], result[8];
+    memcpy(table, &low, 8);
+    memcpy(table + 8, &high, 8);
+    memcpy(control, &mask, 8);
+    for (int i = 0; i < 8; ++i)
+        result[i] = control[i] & 0x80 ? 0 : table[control[i] & 15];
+    uint64_t value;
+    memcpy(&value, result, 8);
+    return value;
 }
 
 uint64_t guest_vector_shift(uint64_t val, uint64_t count, uint32_t kind) {
@@ -2221,6 +2414,21 @@ uint64_t guest_vector_shift(uint64_t val, uint64_t count, uint32_t kind) {
     } else if (kind == 5) { // psrlq
         if (count >= 64) return 0;
         return val >> count;
+    } else if (kind == 6) { // psraw: counts past the width fill with the sign
+        int16_t w[4];
+        memcpy(w, &val, 8);
+        for (int i = 0; i < 4; i++) w[i] = (int16_t)(w[i] >> (count > 15 ? 15 : count));
+        uint64_t res;
+        memcpy(&res, w, 8);
+        return res;
+    } else if (kind == 7) { // psrad
+        int32_t d[2];
+        memcpy(d, &val, 8);
+        d[0] >>= count > 31 ? 31 : count;
+        d[1] >>= count > 31 ? 31 : count;
+        uint64_t res;
+        memcpy(&res, d, 8);
+        return res;
     }
     return 0;
 }
@@ -3139,11 +3347,13 @@ static struct guest_thread *acquire_thread_handle(uint64_t handle) {
 static void init_guest_thread_data(void) {
     put64(teb, 0x08, STACK_BASE + STACK_SIZE);
     put64(teb, 0x10, STACK_BASE);
-    put64(teb, 0x30, TEB_BASE);
-    put64(teb, 0x40, guest_identity(0));
-    put64(teb, 0x48, guest_identity(1));
+    if (!wine_hosted) { /* hosted: Wine filled in Self, ClientId and the PEB pointer */
+        put64(teb, 0x30, TEB_BASE);
+        put64(teb, 0x40, guest_identity(0));
+        put64(teb, 0x48, guest_identity(1));
+        put64(teb, 0x60, PEB_BASE);
+    }
     put64(teb, 0x58, TLS_BASE);
-    put64(teb, 0x60, PEB_BASE);
     put64(tls_storage, 0, TLS_BASE + 0x200);
     if (guest_tls_end_raw > guest_tls_start_raw) {
         uint64_t size = guest_tls_end_raw - guest_tls_start_raw;
@@ -3194,7 +3404,7 @@ static void *run_guest_thread(void *opaque) {
     uint64_t cpu[128] = {0};
     init_guest_cpu(cpu);
     cpu[1] = thread->argument;
-    uint64_t stack_base = GUEST_HEAP_TAG | (uint64_t)(uintptr_t)thread->stack_memory;
+    uint64_t stack_base = (uint64_t)(uintptr_t)thread->stack_memory;
     uint64_t stack_top = stack_base + thread->stack_size;
     put64(teb, 0x08, stack_top);
     put64(teb, 0x10, stack_base);
@@ -3753,7 +3963,9 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
         return (uint64_t)guest_add_vectored_exception_handler((uint32_t)first, second);
     }
     const char *system_name = system_thunk_name(target);
-    if (target < 0x20000000 || system_name || module_span(target, 2, false)) {
+    /* An import-by-name entry in the primary image (as a VA or a bare RVA) or in a module. */
+    if (target < 0x20000000 || system_name || module_span(target, 2, false) ||
+        (guest_image_base && target >= guest_image_base && target - guest_image_base < guest_image_span)) {
         char name[128] = {0};
         bool valid = true;
         if (system_name)
@@ -3765,6 +3977,7 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
             name[i] = (char)c;
         }
         if (valid && name[0]) {
+            count_named_dispatch(name);
             static int trace_imports = -1;
             if (trace_imports < 0)
                 trace_imports = getenv("ARM64_RECOMPILER_TRACE_IMPORTS") != NULL;
@@ -3782,6 +3995,8 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
                 return (name[10] == 'W' ? subsys_CreateFileW : subsys_CreateFileA)(
                     first, (uint32_t)second, (uint32_t)third, fourth, creation, flags, template_file);
             }
+            if (wine_hosted && !strcmp(name, "__wine_unix_call_dispatcher"))
+                return wine_host_unix_call(first, (uint32_t)second, third);
             if (guest_dispatch_generated_shim(name, &shim_res, first, second, third, fourth))
                 return shim_res;
             if (strcmp(name, "GetModuleHandleA") == 0)
@@ -3802,9 +4017,9 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
             }
             if (strcmp(name, "HeapDestroy") == 0) return guest_heap_handle(first) && first != GUEST_HEAP_HANDLE;
             if (strcmp(name, "HeapSize") == 0) {
-                if (!guest_heap_handle(first) || (third & UINT64_C(0xFF00000000000000)) != GUEST_HEAP_TAG)
+                if (!guest_heap_handle(first) || !guest_heap_block(third))
                     return (uint64_t)-1;
-                return malloc_size((void *)(uintptr_t)(third & ~UINT64_C(0xFF00000000000000)));
+                return malloc_size((void *)(uintptr_t)third);
             }
             if (strcmp(name, "HeapValidate") == 0 || strcmp(name, "HeapLock") == 0 ||
                 strcmp(name, "HeapUnlock") == 0 || strcmp(name, "HeapSetInformation") == 0)
@@ -3855,12 +4070,7 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
             if (strcmp(name, "GetThreadPriority") == 0) return 0;
             if (strcmp(name, "SetThreadPriority") == 0) return 1;
             if (strcmp(name, "TryEnterCriticalSection") == 0) {
-                /* Take the section unless another thread owns it. */
-                uint64_t owner = guest_load(first + 16, 8);
-                if (owner && owner != guest_identity(1))
-                    return 0;
-                guest_critical_section(first, 1);
-                return 1;
+                return guest_try_critical_section(first);
             }
             if (strcmp(name, "RaiseException") == 0) {
                 if (!current_cpu)
@@ -4275,17 +4485,30 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
                 }
                 return 1;
             }
-            if (strcmp(name, "__wine_dbg_get_channel_flags") == 0)
-                return getenv("ARM64_RECOMPILER_WINE_DEBUG") ? 0x0f : 0;
-            if (strcmp(name, "__wine_dbg_header") == 0)
-                return getenv("ARM64_RECOMPILER_WINE_DEBUG") ? 0 : (uint64_t)(int64_t)-1;
+            if (strcmp(name, "__wine_dbg_get_channel_flags") == 0) {
+                /* Like ntdll, record the answer in the channel (its first byte), which
+                   clears the "not yet initialized" bit: Wine's TRACE/WARN macros then test
+                   the byte inline and disabled messages cost nothing more. */
+                uint64_t flags = wine_debug_enabled() ? 0x0f : 0;
+                if (first)
+                    guest_store(first, flags, 1);
+                return flags;
+            }
+            if (strcmp(name, "__wine_dbg_header") == 0) {
+                /* (class, channel, function). TRACE/WARN reach this first for a channel
+                   they have not asked about yet; record its flags as above so that a
+                   disabled channel stops formatting arguments and calling here. */
+                if (second)
+                    guest_store(second, wine_debug_enabled() ? 0x0f : 0, 1);
+                return wine_debug_enabled() ? 0 : (uint64_t)(int64_t)-1;
+            }
             if (strcmp(name, "__wine_dbg_strdup") == 0)
                 return first;
             if (strcmp(name, "__wine_dbg_output") == 0) {
                 size_t length = 0;
                 while (first && length < 4096 && guest_load(first + length, 1))
                     ++length;
-                if (getenv("ARM64_RECOMPILER_WINE_DEBUG"))
+                if (wine_debug_enabled())
                     for (size_t i = 0; i < length; ++i)
                         fputc((int)guest_load(first + i, 1), stderr);
                 return length;
@@ -4377,7 +4600,7 @@ static uint64_t nls_file(const char *name, uint64_t *size) {
         snprintf(path, sizeof path, "%s/%s", directory, name) < (int)sizeof path &&
         (fd = open(path, O_RDONLY)) >= 0 && !fstat(fd, &info) && info.st_size > 0 &&
         (address = guest_heap_alloc(GUEST_HEAP_HANDLE, 0, (uint64_t)info.st_size))) {
-        unsigned char *host = (unsigned char *)(uintptr_t)(address & ~UINT64_C(0xFF00000000000000));
+        unsigned char *host = (unsigned char *)(uintptr_t)address;
         ssize_t done = 0;
         while (done < info.st_size) {
             ssize_t n = read(fd, host + done, (size_t)(info.st_size - done));
@@ -4713,6 +4936,14 @@ static bool rtl_override(const char *name, uint64_t a, uint64_t b, uint64_t c, u
             uint64_t copy = counted_string_copy(string, 2);
             uint64_t handle = !copy ? 0 : rest[0] == 'L' ? guest_load_library(copy, 0, 0)
                                                          : guest_module_handle(copy, 1);
+            if (copy && getenv("ARM64_RECOMPILER_TRACE_IMPORTS")) {
+                char text[128];
+                size_t n = 0;
+                for (uint64_t c16; n < sizeof text - 1 && (c16 = guest_load(copy + 2 * n, 2)); ++n)
+                    text[n] = c16 < 127 ? (char)c16 : '?';
+                text[n] = 0;
+                fprintf(stderr, "[ldr] %s(\"%s\") = %#llx\n", name, text, (unsigned long long)handle);
+            }
             if (copy)
                 guest_heap_free(GUEST_HEAP_HANDLE, 0, copy);
             if (out)
@@ -4726,6 +4957,53 @@ static bool rtl_override(const char *name, uint64_t a, uint64_t b, uint64_t c, u
             if (d)
                 guest_store(d, address, 8);
             *result = address ? STATUS_SUCCESS_NT : b ? STATUS_PROCEDURE_NOT_FOUND_NT : STATUS_ORDINAL_NOT_FOUND_NT;
+        } else if (!strcmp(rest, "GetDllPath")) {
+            /*
+             * (module, flags, WCHAR **path, WCHAR **unknown): the DLL search path for a
+             * LoadLibraryEx with LOAD_LIBRARY_SEARCH_* flags. Lifted modules have no
+             * directories; the system directory is where the loader says they all are.
+             * The caller frees it with RtlReleasePath, from the process heap.
+             */
+            static const char folder[] = "C:\\windows\\system32";
+            uint64_t text = guest_heap_alloc(GUEST_HEAP_HANDLE, 0, 2 * sizeof folder);
+            for (size_t i = 0; text && i < sizeof folder; ++i)
+                guest_store(text + 2 * i, (unsigned char)folder[i], 2);
+            if (text && c)
+                guest_store(c, text, 8);
+            if (d)
+                guest_store(d, 0, 8);
+            *result = text ? STATUS_SUCCESS_NT : STATUS_NO_MEMORY_NT;
+        } else if (!strcmp(rest, "GetDllFullName")) {
+            /* (module, UNICODE_STRING *name): the program's path, or a DLL in the system directory. */
+            char path[400];
+            uint16_t wide[400];
+            size_t length = 0;
+            struct guest_module *module = a && a != guest_image_base ? find_guest_module(a) : NULL;
+            if (module) {
+                snprintf(path, sizeof path, "C:\\windows\\system32\\%s", module->name);
+            } else if (a && a != guest_image_base) {
+                *result = STATUS_DLL_NOT_FOUND_NT;
+                return true;
+            } else if (host_peb) { /* hosted: the image path Wine recorded in the process parameters */
+                uint64_t parameters = guest_load((uint64_t)(uintptr_t)host_peb + 0x20, 8);
+                uint64_t bytes = guest_load(parameters + 0x60, 2), text = guest_load(parameters + 0x68, 8);
+                for (; length < bytes / 2 && length < 399; ++length)
+                    wide[length] = (uint16_t)guest_load(text + 2 * length, 2);
+                path[0] = 0;
+            } else {
+                snprintf(path, sizeof path, "C:\\program.exe");
+            }
+            if (!length)
+                for (; path[length]; ++length)
+                    wide[length] = (unsigned char)path[length];
+            uint64_t capacity = guest_load(b + 2, 2), buffer = guest_load(b + 8, 8);
+            size_t copied = length * 2 + 2 <= capacity ? length : capacity / 2 ? capacity / 2 - 1 : 0;
+            for (size_t i = 0; i < copied; ++i)
+                guest_store(buffer + 2 * i, wide[i], 2);
+            if (capacity >= 2)
+                guest_store(buffer + 2 * copied, 0, 2);
+            guest_store(b, copied * 2, 2);
+            *result = copied == length ? STATUS_SUCCESS_NT : 0xc0000023; /* STATUS_BUFFER_TOO_SMALL */
         } else if (!strcmp(rest, "UnloadDll")) {
             *result = guest_free_library(a) ? STATUS_SUCCESS_NT : STATUS_DLL_NOT_FOUND_NT;
         } else if (!strcmp(rest, "AddRefDll") || !strcmp(rest, "UnlockLoaderLock")) {
@@ -4744,6 +5022,8 @@ static bool rtl_override(const char *name, uint64_t a, uint64_t b, uint64_t c, u
     return false;
 }
 
+#include "console_wine_host.h"
+
 uint64_t guest_named_call(uint64_t *cache, const char *name, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     static int trace = -1;
     if (trace < 0)
@@ -4752,6 +5032,33 @@ uint64_t guest_named_call(uint64_t *cache, const char *name, uint64_t a, uint64_
         fprintf(stderr, "[override] %s(%#llx, %#llx, %#llx, %#llx)\n", name, (unsigned long long)a,
                 (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
     uint64_t result;
+    if (!trace) {
+        /* The hottest runtime-owned entry points: resolve the name once per call site. */
+        uint64_t fast = atomic_load_explicit((_Atomic uint64_t *)cache, memory_order_relaxed);
+        if (!fast) {
+            static const char *const names[] = {"RtlAllocateHeap", "RtlFreeHeap", "RtlReAllocateHeap", "RtlSizeHeap",
+                                                "RtlEnterCriticalSection", "RtlLeaveCriticalSection",
+                                                "RtlGetLastWin32Error", "RtlSetLastWin32Error"};
+            for (size_t i = 0; i < sizeof names / sizeof *names; ++i)
+                if (!strcmp(name, names[i])) {
+                    fast = i + 1;
+                    atomic_store_explicit((_Atomic uint64_t *)cache, fast, memory_order_relaxed);
+                }
+        }
+        switch (fast) {
+        case 1: return guest_heap_alloc(a, (uint32_t)b & GUEST_HEAP_FLAGS, c);
+        case 2: return guest_heap_free(a, (uint32_t)b, c);
+        case 3: return guest_heap_realloc(a, (uint32_t)b & GUEST_HEAP_FLAGS, c, d);
+        case 4: return guest_heap_handle(a) && guest_heap_block(c) ? malloc_size((void *)(uintptr_t)c) : UINT64_MAX;
+        case 5: guest_critical_section(a, 1); return STATUS_SUCCESS_NT;
+        case 6: guest_critical_section(a, 0); return STATUS_SUCCESS_NT;
+        case 7: return last_error;
+        case 8: last_error = (uint32_t)a; return 0;
+        default: break;
+        }
+    }
+    if (wine_hosted && wine_host_syscall(cache, name, a, b, c, d, &result))
+        return result;
     if (rtl_override(name, a, b, c, d, &result))
         return result;
     uint64_t token = atomic_load_explicit((_Atomic uint64_t *)cache, memory_order_relaxed);
@@ -4789,8 +5096,9 @@ static void (*module_dispatch(const struct guest_module *module, uint64_t target
     return NULL;
 }
 
-static inline __attribute__((always_inline)) void (*guest_lookup_dispatch(uint64_t target))(void *, uint64_t) {
-    if (guest_image_base && target >= guest_image_base && target - guest_image_base < 0x20000000)
+/* Slow path: search the module tables, then the primary image's. */
+static __attribute__((noinline)) void (*guest_resolve_dispatch(uint64_t target))(void *, uint64_t) {
+    if (guest_image_base && target >= guest_image_base && target - guest_image_base < guest_image_span)
         target -= guest_image_base;
 
     for (size_t i = 0; i < guest_module_count; ++i) {
@@ -4804,25 +5112,57 @@ static inline __attribute__((always_inline)) void (*guest_lookup_dispatch(uint64
             return fn;
     }
 
-    static _Thread_local struct { uint64_t rva; void (*fn)(void *, uint64_t); } cache[1024];
-    size_t slot = (target ^ (target >> 6)) & 1023;
-    if (cache[slot].rva == target && cache[slot].fn)
-        return cache[slot].fn;
-
     size_t low = 0, high = guest_dispatch_count;
     while (low < high) {
         size_t mid = low + (high - low) / 2;
-        if (guest_dispatch_table[mid].rva == target) {
-            cache[slot].rva = target;
-            cache[slot].fn = guest_dispatch_table[mid].fn;
+        if (guest_dispatch_table[mid].rva == target)
             return guest_dispatch_table[mid].fn;
-        }
         if (guest_dispatch_table[mid].rva < target)
             low = mid + 1;
         else
             high = mid;
     }
     return NULL;
+}
+
+/*
+ * Guest code address -> lifted function. Every indirect call and every call
+ * between DLLs comes through here, so a direct-mapped cache fronts the table
+ * search. The cache is shared by all threads without a lock (a thread-local
+ * one costs a TLS lookup per call): a writer clears the key, stores the
+ * function, then stores the key, and a reader accepts the function only if
+ * the key matched both before and after reading it. Unloading a module
+ * (dispatch_generation) empties the cache.
+ */
+enum { DISPATCH_SLOTS = 8192 };
+static struct {
+    _Atomic uint64_t target;
+    void (*_Atomic fn)(void *, uint64_t);
+} dispatch_cache[DISPATCH_SLOTS];
+static _Atomic uint64_t dispatch_cache_generation;
+
+static inline __attribute__((always_inline)) void (*guest_lookup_dispatch(uint64_t target))(void *, uint64_t) {
+    size_t slot = (target ^ (target >> 4) ^ (target >> 17)) & (DISPATCH_SLOTS - 1);
+    if (atomic_load_explicit(&dispatch_cache[slot].target, memory_order_relaxed) == target &&
+        atomic_load_explicit(&dispatch_cache_generation, memory_order_relaxed) ==
+            atomic_load_explicit(&dispatch_generation, memory_order_relaxed)) {
+        void (*cached)(void *, uint64_t) = atomic_load_explicit(&dispatch_cache[slot].fn, memory_order_relaxed);
+        if (cached && atomic_load_explicit(&dispatch_cache[slot].target, memory_order_relaxed) == target)
+            return cached;
+    }
+    uint64_t generation = atomic_load(&dispatch_generation);
+    if (atomic_load(&dispatch_cache_generation) != generation) {
+        for (size_t i = 0; i < DISPATCH_SLOTS; ++i)
+            atomic_store(&dispatch_cache[i].target, 0);
+        atomic_store(&dispatch_cache_generation, generation);
+    }
+    void (*fn)(void *, uint64_t) = guest_resolve_dispatch(target);
+    if (fn && target) {
+        atomic_store(&dispatch_cache[slot].target, 0);
+        atomic_store(&dispatch_cache[slot].fn, fn);
+        atomic_store(&dispatch_cache[slot].target, target);
+    }
+    return fn;
 }
 
 #include "x86_interpret.h"
@@ -4847,7 +5187,7 @@ static __attribute__((noreturn)) void guest_execute_violation(uint64_t *regs, ui
 
 __attribute__((always_inline)) uint64_t guest_indirect_dispatch(void *cpu, uint64_t target, uint64_t return_va, uint32_t tail) {
     current_cpu = cpu;
-    if (guest_image_base && target >= guest_image_base && target - guest_image_base < 0x20000000)
+    if (guest_image_base && target >= guest_image_base && target - guest_image_base < guest_image_span)
         target -= guest_image_base;
     void (*fn)(void *, uint64_t) = guest_lookup_dispatch(target);
     uint64_t *regs = (uint64_t *)cpu;
@@ -4959,7 +5299,7 @@ uint64_t guest_virtual_protect(uint64_t address, uint64_t size, uint32_t new_pro
             guest_store(old_protect_ptr, region_old, 4);
         return region_ok;
     }
-    if (guest_image_base && address >= guest_image_base && address - guest_image_base < 0x20000000)
+    if (guest_image_base && address >= guest_image_base && address - guest_image_base < guest_image_span)
         address -= guest_image_base;
     for (uint64_t i = 0; i < guest_section_count; ++i) {
         const struct section *section = &guest_sections[i];
@@ -4968,67 +5308,123 @@ uint64_t guest_virtual_protect(uint64_t address, uint64_t size, uint32_t new_pro
             if (section_protection)
                 section_protection[i] = new_protect;
             int prot = win32_to_posix_prot(new_protect);
-            size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
-            uintptr_t host_addr = (uintptr_t)(image[i] + (address - section->address));
-            uintptr_t page_start = host_addr & ~(page_size - 1);
-            uintptr_t page_end = (host_addr + size + page_size - 1) & ~(page_size - 1);
-            uintptr_t max_end = (uintptr_t)image[i] + ((section->size + page_size - 1) & ~(page_size - 1));
-            if (page_end > max_end)
-                page_end = max_end;
-            if (page_start < (uintptr_t)image[i])
-                page_start = (uintptr_t)image[i];
-            if (page_end > page_start && mprotect((void *)page_start, page_end - page_start, prot) == 0) {
-                for (uintptr_t page = page_start; page < page_end; page += page_size)
-                    image_page_prot[i][(page - (uintptr_t)image[i]) / page_size] = prot;
-                image_update_fast(i, section->writable);
+            uint64_t section_end = section->address + section->size;
+            uint64_t range_end = size < section_end - address ? address + size : section_end;
+            uint64_t first = address >> 12, end = (range_end + 0xfff) >> 12;
+            if (end > image_prot_pages)
+                end = image_prot_pages;
+            for (uint64_t page = first; page < end; ++page)
+                image_prot[page] = (uint8_t)prot;
+            /* Host pages are larger than guest pages: each gets the union of its guest pages. */
+            uint64_t scale = (uint64_t)sysconf(_SC_PAGESIZE) >> 12;
+            if (!scale)
+                scale = 1;
+            for (uint64_t host = first / scale; host * scale < end; ++host) {
+                int all = 0;
+                for (uint64_t page = host * scale; page < (host + 1) * scale && page < image_prot_pages; ++page)
+                    all |= image_prot[page];
+                mprotect(image[0] - guest_sections[0].address + (host * scale << 12), scale << 12, all);
             }
+            for (uint64_t j = 0; j < guest_section_count; ++j)
+                image_update_fast(j, guest_sections[j].writable);
             if (old_protect_ptr)
                 guest_store(old_protect_ptr, old, 4);
             return 1;
         }
-    }
-    if ((address & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
-        if (old_protect_ptr)
-            guest_store(old_protect_ptr, 0x04, 4);
-        return 1;
     }
     if (old_protect_ptr)
         guest_store(old_protect_ptr, 0x04, 4);
     return 1;
 }
 
-void guest_critical_section(uint64_t address, uint32_t entering) {
+/*
+ * Critical sections are real locks: the owner field (OwningThread) is claimed
+ * with a compare-and-swap, so the uncontended path takes no host lock. A
+ * thread that finds the section owned waits on one shared condition, which a
+ * leaving owner signals only when some thread is waiting.
+ */
+static pthread_mutex_t critical_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t critical_released = PTHREAD_COND_INITIALIZER;
+static atomic_uint critical_waiters;
+
+static _Atomic uint64_t *critical_owner(uint64_t address) {
+    /* Sections live in writable guest memory (data, heap or stack). */
+    return (_Atomic uint64_t *)(uintptr_t)read_span(address + 16, 8);
+}
+
+static void critical_enter_owned(uint64_t address) {
     uint64_t depth = guest_load(address + 12, 4);
-    uint64_t owner = guest_load(address + 16, 8);
+    if (depth == UINT32_MAX)
+        guest_trap("unsupported critical section ownership state");
+    guest_store(address + 8, depth, 4);
+    guest_store(address + 12, depth + 1, 4);
+}
+
+/* TryEnterCriticalSection: take the section unless another thread owns it. */
+static bool guest_try_critical_section(uint64_t address) {
+    _Atomic uint64_t *owner = critical_owner(address);
+    uint64_t thread = guest_identity(1), expected = 0;
+    if (atomic_load(owner) != thread && !atomic_compare_exchange_strong(owner, &expected, thread))
+        return false;
+    critical_enter_owned(address);
+    return true;
+}
+
+void guest_critical_section(uint64_t address, uint32_t entering) {
     if (entering == 2) {
-        if (depth || owner)
+        if (guest_load(address + 12, 4) || guest_load(address + 16, 8))
             guest_trap("cannot delete an owned critical section");
         guest_heap_free(0x7fff2001, 0, guest_load(address, 8));
         for (unsigned offset = 0; offset < 40; offset += 8)
             guest_store(address + offset, 0, 8);
         return;
     }
+    _Atomic uint64_t *owner = critical_owner(address);
     uint64_t thread = guest_identity(1);
-    if ((owner && owner != thread) || (!entering && !depth) ||
-        (entering && depth == UINT32_MAX))
+    if (entering) {
+        uint64_t expected = 0;
+        if (atomic_load(owner) != thread && !atomic_compare_exchange_strong(owner, &expected, thread)) {
+            /* Owned by another thread: wait for it to leave. */
+            pthread_mutex_lock(&critical_wait_lock);
+            atomic_fetch_add(&critical_waiters, 1);
+            for (expected = 0; !atomic_compare_exchange_strong(owner, &expected, thread); expected = 0)
+                pthread_cond_wait(&critical_released, &critical_wait_lock);
+            atomic_fetch_sub(&critical_waiters, 1);
+            pthread_mutex_unlock(&critical_wait_lock);
+        }
+        critical_enter_owned(address);
+        return;
+    }
+    uint64_t depth = guest_load(address + 12, 4);
+    if (atomic_load(owner) != thread || !depth)
         guest_trap("unsupported critical section ownership state");
-    depth = entering ? depth + 1 : depth - 1;
+    --depth;
     guest_store(address + 8, depth - 1, 4);
     guest_store(address + 12, depth, 4);
-    guest_store(address + 16, depth ? thread : 0, 8);
+    if (!depth) {
+        atomic_store(owner, 0);
+        if (atomic_load(&critical_waiters)) {
+            pthread_mutex_lock(&critical_wait_lock);
+            pthread_cond_broadcast(&critical_released);
+            pthread_mutex_unlock(&critical_wait_lock);
+        }
+    }
 }
 
 void guest_check_return(uint64_t addr, uint64_t expected) {
     uint64_t actual = guest_load(addr, 8);
     if (actual != expected) {
         fputs("guest return address mismatch\n", stderr);
-        fprintf(stderr, "actual %#llx != expected %#llx at rsp %#llx\n",
-                (unsigned long long)actual, (unsigned long long)expected, (unsigned long long)addr);
+        fprintf(stderr, "actual %#llx != expected %#llx at rsp %#llx, last traced RVA %#llx\n",
+                (unsigned long long)actual, (unsigned long long)expected, (unsigned long long)addr,
+                (unsigned long long)guest_pc);
         exit(125);
     }
 }
 
 uint64_t guest_identity(uint32_t thread) {
+    if (wine_hosted) /* the ids wineserver assigned: TEB->ClientId */
+        return *(uint64_t *)(void *)(teb + (thread ? 0x48 : 0x40));
     if (!thread)
         return (uint32_t)getpid();
     uint64_t id;
@@ -5369,6 +5765,21 @@ static void dispatch_guest_exception(uint32_t code, uint32_t flags, uint32_t cou
             delivering_fault = false;
             longjmp(*guest_resume_boundary, 1);
         }
+    }
+    if (code == 0x80000100 && guest_load(record + 24, 4) >= 2) {
+        /* EXCEPTION_WINE_STUB: a Wine DLL export that is declared but not implemented. */
+        char names[2][96];
+        for (int i = 0; i < 2; ++i) {
+            uint64_t text = guest_load(record + 32 + i * 8, 8);
+            size_t n = 0;
+            if (text >> 16) /* a name; otherwise an ordinal */
+                for (uint64_t c; n < sizeof names[i] - 1 && (c = guest_load(text + n, 1)); ++n)
+                    names[i][n] = c >= 32 && c < 127 ? (char)c : '?';
+            else
+                n = (size_t)snprintf(names[i], sizeof names[i], "#%llu", (unsigned long long)text);
+            names[i][n] = 0;
+        }
+        fprintf(stderr, "Call to unimplemented Wine function %s.%s\n", names[0], names[1]);
     }
     guest_heap_free(0x7fff2001, 0, record);
     fprintf(stderr, "Unhandled guest exception 0x%08x at %#llx\n", code, (unsigned long long)pc);
@@ -5837,6 +6248,15 @@ static void init_process_parameters(void) {
     snprintf(image_path, sizeof image_path, "%s%s", directory,
              host_argc > 0 && host_argv[0] ? (strrchr(host_argv[0], '/') ? strrchr(host_argv[0], '/') + 1 : host_argv[0])
                                            : "app.exe");
+    const char *hosted_program = wine_hosted ? getenv("ARM64_RECOMPILER_WINE_EXE") : NULL;
+    char resolved[1024];
+    if (wine_hosted && realpath(hosted_program ? hosted_program : host_argv[0], resolved)) {
+        /* The original .exe, as Wine's Z: drive names it. */
+        snprintf(image_path, sizeof image_path, "Z:%s", resolved);
+        for (char *c = image_path; *c; ++c)
+            if (*c == '/')
+                *c = '\\';
+    }
     put_unicode_string(params + 0x60, image_path, 0);     /* ImagePathName */
     /* CommandLine (wide). guest_command_line stops on non-ASCII arguments, so
        only build it eagerly when every argument is ASCII. */
@@ -5860,7 +6280,19 @@ static void init_process_parameters(void) {
     put_unicode_string(params + 0xc0, "", 0);             /* Desktop */
     put_unicode_string(params + 0xd0, "", 0);             /* ShellInfo */
     guest_store(params + 0x3f0, environment ? (units + 2) * 2 : 0, 8); /* EnvironmentSize */
-    put64(peb, 0x20, params);
+    if (!wine_hosted) {
+        put64(peb, 0x20, params);
+    } else {
+        /*
+         * Hosted: Wine built the real process parameters, but for its start.exe
+         * fallback (it could not map the program at its base, which the lifted
+         * image occupies). Name the program and its command line correctly.
+         */
+        uint64_t wine_params = *(uint64_t *)(void *)(peb + 0x20);
+        static const unsigned fields[] = {0x60, 0x70, 0xb0}; /* ImagePathName, CommandLine, WindowTitle */
+        for (size_t i = 0; wine_params && i < sizeof fields / sizeof *fields; ++i)
+            memcpy((void *)(uintptr_t)(wine_params + fields[i]), (const void *)(uintptr_t)(params + fields[i]), 16);
+    }
     /* FastPebLock: RtlAcquirePebLock enters it around ProcessParameters updates. */
     uint64_t lock = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, 40);
     if (lock) {
@@ -5877,6 +6309,67 @@ static void init_process_parameters(void) {
         memcpy(peb + fields[i][0], &fields[i][1], 4);
 }
 
+/*
+ * Claim every linked-in module's guest address range before the host
+ * allocator can place anything there. The pages stay untouched until a load.
+ */
+static void reserve_guest_modules(void) {
+    for (size_t i = 0; i < guest_module_count; ++i)
+        if (!guest_map_fixed(guest_modules[i].base, guest_modules[i].size)) {
+            fprintf(stderr, "cannot reserve guest address %#llx for %s\n",
+                    (unsigned long long)guest_modules[i].base, guest_modules[i].name);
+            exit(125);
+        }
+}
+
+/*
+ * Fill guest_modules from the shared libraries the program was built against.
+ * Each is looked for in ARM64_RECOMPILER_MODULE_DIR, beside the program, in
+ * ../Frameworks (an application bundle), then in the build's module store.
+ */
+extern int _NSGetExecutablePath(char *, uint32_t *); /* <mach-o/dyld.h> defines its own struct section */
+
+static void load_module_libraries(void) {
+    if (!guest_module_libraries)
+        return;
+    char program[PATH_MAX], folder[PATH_MAX] = "";
+    uint32_t size = sizeof program;
+    if (!_NSGetExecutablePath(program, &size) && realpath(program, folder)) {
+        char *slash = strrchr(folder, '/');
+        if (slash)
+            *slash = 0;
+    }
+    char bundle[PATH_MAX + 16] = "";
+    if (*folder)
+        snprintf(bundle, sizeof bundle, "%s/../Frameworks", folder);
+    const char *const folders[] = {getenv("ARM64_RECOMPILER_MODULE_DIR"), folder, bundle, guest_module_store};
+    for (size_t i = 0; i < guest_module_count; ++i) {
+        const char *name = guest_module_libraries[i];
+        void *library = NULL;
+        char reason[512] = "not found";
+        for (size_t j = 0; !library && j < sizeof folders / sizeof *folders; ++j) {
+            char path[PATH_MAX + 256];
+            if (!folders[j] || !*folders[j])
+                continue;
+            snprintf(path, sizeof path, "%s/%s", folders[j], name);
+            if (access(path, R_OK))
+                continue;
+            library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (!library)
+                snprintf(reason, sizeof reason, "%s", dlerror());
+        }
+        const struct guest_module *module = library ? dlsym(library, "translated_guest_module") : NULL;
+        if (!module) {
+            fprintf(stderr, "cannot load lifted module %s: %s\n", name, reason);
+            exit(125);
+        }
+        guest_modules[i] = *module;
+    }
+}
+
+static int guest_run(void);
+static int wine_host_boot(const char *directory, int argc, char **argv);
+
 int main(int argc, char **argv) {
     const char *watch = getenv("GUEST_WATCH_RVA");
     if (watch && *watch) {
@@ -5887,34 +6380,39 @@ int main(int argc, char **argv) {
     }
     host_argc = argc;
     host_argv = argv;
-    init_runtime_data();
-    put64(peb, 0x10, guest_image_base);
-    put64(peb, 0x30, 0x7fff2001); /* ProcessHeap, read directly by Wine's CRT */
-    init_process_parameters();
+    trace_time("main", NULL);
     image = calloc(guest_section_count ? guest_section_count : 1, sizeof *image);
     section_protection = calloc(guest_section_count ? guest_section_count : 1, sizeof *section_protection);
-    image_page_prot = calloc(guest_section_count ? guest_section_count : 1, sizeof *image_page_prot);
-    image_page_count = calloc(guest_section_count ? guest_section_count : 1, sizeof *image_page_count);
-    if (!image || !section_protection || !image_page_prot || !image_page_count)
+    if (!image || !section_protection)
         fault();
-    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uint64_t image_size = 0;
+    for (uint64_t i = 0; i < guest_section_count; ++i)
+        if (guest_sections[i].address + guest_sections[i].size > image_size)
+            image_size = guest_sections[i].address + guest_sections[i].size;
+    if (!image_size)
+        image_size = 1;
+    unsigned char *mapping = guest_map_fixed(guest_image_base, image_size);
+    load_module_libraries();
+    reserve_guest_modules();
+    if (!mapping) {
+        fprintf(stderr, "cannot map the program image at guest address %#llx\n",
+                (unsigned long long)guest_image_base);
+        exit(125);
+    }
+    guest_image_span = image_size;
+    guest_primary_base = guest_image_base;
+    guest_primary_span = image_size;
+    image_prot_pages = (image_size + 0xfff) >> 12;
+    image_prot = malloc(image_prot_pages);
+    if (!image_prot)
+        fault();
+    memset(image_prot, PROT_READ | PROT_WRITE, image_prot_pages);
     for (uint64_t i = 0; i < guest_section_count; ++i) {
         const struct section *section = &guest_sections[i];
-        size_t alloc_size = (section->size + page_size - 1) & ~(page_size - 1);
-        if (!alloc_size)
-            alloc_size = page_size;
-        image[i] = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (image[i] == MAP_FAILED)
-            fault();
+        image[i] = mapping + section->address;
         section_protection[i] = section->writable ? 0x04 : 0x02;
         if (section->initial_size)
             memcpy(image[i], section->initial, section->initial_size);
-        image_page_count[i] = alloc_size / page_size;
-        image_page_prot[i] = malloc(image_page_count[i] * sizeof **image_page_prot);
-        if (!image_page_prot[i])
-            fault();
-        for (size_t page = 0; page < image_page_count[i]; ++page)
-            image_page_prot[i][page] = PROT_READ | PROT_WRITE;
         image_update_fast(i, section->writable);
     }
     for (uint64_t i = 0; i < guest_section_count && i < 64; ++i) {
@@ -5932,10 +6430,44 @@ int main(int argc, char **argv) {
             if (!image_page_section[page] || (guest_sections[i].address & 0xfff) == 0)
                 image_page_section[page] = (uint8_t)(i + 1);
     }
+    /* The image and module ranges are claimed; Wine may now place its own mappings. */
+    const char *host = getenv("ARM64_RECOMPILER_WINE_HOST");
+    if (host && *host)
+        return wine_host_boot(host, argc, argv);
+    return guest_run();
+}
+
+/*
+ * Windows' ntdll sets up the PEB's TLS bitmaps at process start; the runtime
+ * loader stands in for that code, and a lifted kernelbase.dll's TlsAlloc
+ * allocates from them. RTL_BITMAP is { ULONG SizeOfBitMap; ULONG *Buffer }.
+ */
+static void init_peb_tls_bitmaps(void) {
+    uint64_t bitmaps = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, 32);
+    if (!bitmaps)
+        return;
+    guest_store(bitmaps, 64, 4);
+    guest_store(bitmaps + 8, PEB_BASE + 0x80, 8);     /* TlsBitmapBits */
+    guest_store(bitmaps + 16, 1024, 4);
+    guest_store(bitmaps + 24, PEB_BASE + 0x240, 8);   /* TlsExpansionBitmapBits */
+    memset(peb + 0x80, 0, 8);
+    memset(peb + 0x240, 0, 128);
+    peb[0x80] = 1;                                    /* TLS index 0 is reserved */
+    put64(peb, 0x78, bitmaps);
+    put64(peb, 0x238, bitmaps + 16);
+}
+
+/* Process and main-thread setup, then the program's entry point. */
+static int guest_run(void) {
+    init_runtime_data();
+    put64(peb, 0x10, guest_image_base);
+    put64(peb, 0x30, 0x7fff2001); /* ProcessHeap, read directly by Wine's CRT */
+    init_process_parameters();
+    init_peb_tls_bitmaps();
     init_guest_thread_data();
     if (guest_tls_index_va) {
         uint64_t idx_addr = guest_tls_index_va;
-        if (guest_image_base && idx_addr >= guest_image_base && idx_addr - guest_image_base < 0x20000000)
+        if (guest_image_base && idx_addr >= guest_image_base && idx_addr - guest_image_base < guest_image_span)
             idx_addr -= guest_image_base;
         for (uint64_t i = 0; i < guest_section_count; ++i) {
             const struct section *sec = &guest_sections[i];
@@ -5951,6 +6483,7 @@ int main(int argc, char **argv) {
     if (!setjmp(boundary)) {
         if (guest_fault_signals_enabled())
             init_guest_signal_handler();
+        trace_time("entering program", NULL);
         return (int)lifted_console();
     }
     return (int)resume_guest();

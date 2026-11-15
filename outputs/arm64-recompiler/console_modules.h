@@ -30,7 +30,8 @@ struct guest_module {
     const char *name;
     uint64_t base, size;
     uint64_t exception_rva, exception_size;
-    const unsigned char *file;
+    /* SHA-256 and size of the DLL file this module was lifted from. */
+    unsigned char file_hash[32];
     size_t file_size;
     const struct section *sections;
     size_t section_count;
@@ -45,4 +46,6 @@ struct guest_module {
     bool loading;
     unsigned references;
     unsigned char **memory;
+    /* The image as mapped (page-aligned, size rounded up to a page), or NULL. */
+    unsigned char *image;
 };

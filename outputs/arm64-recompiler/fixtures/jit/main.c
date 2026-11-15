@@ -19,7 +19,7 @@
 #define PAGE_READWRITE 0x04
 #define PAGE_EXECUTE_READ 0x20
 #define PAGE_EXECUTE_READWRITE 0x40
-#define RESULTS 34
+#define RESULTS 50
 
 struct exception_record {
     DWORD code, flags;
@@ -51,6 +51,10 @@ static const uint64_t expected[RESULTS] = {
     0x0100010100010001, 0x0100010001000001,
     0xffffffd6, 0x100000000, 1, 0xfffffffffffffff2, 2, 4, 55, 42, 0x28, 234,
     0x10000, 0xabababababababab, 0x1122334455667788, 0x77,
+    0xccbbaa9900887766, 0xffeedd, 0x5544332211000000, 0xccbbaa9900887766,
+    0x8776655443322100, 0xfeeddccbbaa99000, 0x7766500033221000, 0xeeddc000aa990000,
+    0x110e0cca08860442, 0x1ffc1bb817741320, 0xf10e0cca08860442, 0xfffdfbb9f775f320,
+    0xffffffff00000000, 0xffffffffffffffff, 0x0, 0x0,
 };
 
 static uint64_t out[RESULTS];

@@ -27,7 +27,7 @@ static bool guest_code_contains(uint64_t pc, uint64_t size) {
 }
 
 static bool x86_image_va(uint64_t va) {
-    return guest_image_base && va >= guest_image_base && va - guest_image_base < 0x20000000;
+    return guest_image_base && va >= guest_image_base && va - guest_image_base < guest_image_span;
 }
 
 /* Whether the interpreter may fetch from va: image code or an executable VirtualAlloc page. */
@@ -271,7 +271,7 @@ static uint64_t x86_address(const uint64_t *cpu, const struct x86_operand *rm, u
     if (rm->index >= 0)
         address += cpu[x86_register_slots[rm->index]] * rm->scale;
     if (rm->gs)
-        address += 0x2101000;
+        address += guest_teb();
     return address;
 }
 
@@ -778,6 +778,39 @@ static uint64_t x86_interpret(uint64_t *cpu, uint64_t pc, uint64_t return_va) {
             uint64_t lanes[2];
             x86_xmm_read(cpu, &rm, pc, 16, lanes);
             x86_xmm_set(cpu, reg, cpu[X86_XMM + reg * 2] ^ lanes[0], cpu[X86_XMM + reg * 2 + 1] ^ lanes[1]);
+            continue;
+        }
+        case 0x171: case 0x172: case 0x173: { /* SSE2 shifts by an immediate: words, dwords, qwords */
+            modrm = x86_decode_modrm(&pc, rex, gs, &rm);
+            unsigned kind = (modrm >> 3) & 7, count = (unsigned)x86_fetch(&pc, 1);
+            if (!operand16 || !rm.is_register)
+                x86_unsupported(start, "MMX opcode 0x0f", op & 0xff);
+            uint64_t lanes[2] = {cpu[X86_XMM + rm.reg * 2], cpu[X86_XMM + rm.reg * 2 + 1]};
+            if (op == 0x173 && (kind == 3 || kind == 7)) { /* psrldq, pslldq: the whole register, by bytes */
+                unsigned __int128 value = ((unsigned __int128)lanes[1] << 64) | lanes[0];
+                value = count > 15 ? 0 : kind == 3 ? value >> (count * 8) : value << (count * 8);
+                lanes[0] = (uint64_t)value;
+                lanes[1] = (uint64_t)(value >> 64);
+            } else if (kind == 2 || kind == 6 || (kind == 4 && op != 0x173)) { /* psrl, psll, psra */
+                unsigned width = op == 0x171 ? 16 : op == 0x172 ? 32 : 64;
+                for (unsigned lane = 0; lane < 2; ++lane) {
+                    uint64_t result = 0;
+                    for (unsigned shift = 0; shift < 64; shift += width) {
+                        uint64_t element = (lanes[lane] >> shift) & x86_mask(width / 8), shifted;
+                        if (kind == 4) /* arithmetic: counts past the width fill with the sign */
+                            shifted = (uint64_t)(x86_signed(element, width / 8) >> (count < width ? count : width - 1));
+                        else if (count >= width)
+                            shifted = 0;
+                        else
+                            shifted = kind == 2 ? element >> count : element << count;
+                        result |= (shifted & x86_mask(width / 8)) << shift;
+                    }
+                    lanes[lane] = result;
+                }
+            } else {
+                x86_unsupported(start, "opcode 0x0f", op & 0xff);
+            }
+            x86_xmm_set(cpu, rm.reg, lanes[0], lanes[1]);
             continue;
         }
         case 0x16e: case 0x17e: case 0x1d6: { /* movd/movq */

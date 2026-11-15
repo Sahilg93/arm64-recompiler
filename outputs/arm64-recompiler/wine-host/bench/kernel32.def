@@ -1,0 +1,9 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess
+GetStdHandle
+WriteFile
+QueryPerformanceCounter
+QueryPerformanceFrequency
+Sleep
+GetCommandLineW

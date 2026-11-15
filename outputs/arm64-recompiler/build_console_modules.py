@@ -28,7 +28,7 @@ SYSTEM_API_SET_PREFIXES = ("api-ms-win-core-", "api-ms-win-security-", "api-ms-w
 def resolve_api_set(name):
     """Map an import DLL name to the DLL that implements it, like the API-set schema."""
     lower = name.lower()
-    if not lower.endswith(".dll"):
+    if not lower.endswith((".dll", ".drv")):
         lower += ".dll"
     if lower.startswith("api-ms-win-crt-"):
         return "ucrtbase.dll"
@@ -38,7 +38,15 @@ def resolve_api_set(name):
 # System DLLs that become lifted guest modules when the program supplies them
 # (shipped beside it, or passed explicitly). The runtime still implements their
 # syscalls and process-global state (see system_overrides).
-LIFTABLE_SYSTEM_DLLS = {"ntdll.dll", "kernelbase.dll"}
+LIFTABLE_SYSTEM_DLLS = {"ntdll.dll", "kernelbase.dll",
+                        # Wine's GUI stack and the DLLs under it, for programs that run hosted
+                        # on Wine's unix side (see wine-host/): win32u.dll is the syscall
+                        # boundary, served natively by win32u.so.
+                        "user32.dll", "gdi32.dll", "win32u.dll", "kernel32.dll", "advapi32.dll",
+                        "sechost.dll", "shell32.dll", "shlwapi.dll", "ole32.dll",
+                        # Wine's own, over its unix side: ws2_32.dll reaches sockets through
+                        # ntdll's NtDeviceIoControlFile and ws2_32.so.
+                        "ws2_32.dll", "oleaut32.dll", "userenv.dll"}
 
 # ntdll exports the runtime implements: they own process-global state (heaps,
 # last error, locks, TLS/FLS, loader, exceptions) that must stay shared with the
@@ -67,10 +75,12 @@ NTDLL_RUNTIME_EXPORTS = {
     "RtlExitUserProcess", "RtlExitUserThread",
     "LdrLoadDll", "LdrGetDllHandle", "LdrGetDllHandleEx", "LdrGetProcedureAddress", "LdrUnloadDll",
     "LdrAddRefDll", "LdrLockLoaderLock", "LdrUnlockLoaderLock", "LdrFindEntryForAddress",
-    "LdrGetDllFullName", "LdrGetDllPath", "LdrResolveDelayLoadedAPI", "LdrShutdownProcess",
+    "LdrGetDllFullName", "LdrGetDllPath", "LdrShutdownProcess",
     "LdrShutdownThread", "LdrInitializeThunk", "LdrRegisterDllNotification",
     "LdrUnregisterDllNotification", "LdrQueryProcessModuleInformation",
-    "LdrAccessResource", "LdrFindResource_U", "LdrFindResourceDirectory_U",
+    # LdrFindResource_U, LdrFindResourceDirectory_U and LdrAccessResource stay lifted:
+    # they only walk the mapped image's resource directory. LdrResolveDelayLoadedAPI
+    # stays lifted too: it resolves through LdrLoadDll and LdrGetProcedureAddress.
     # Debug channels: the runtime drops messages unless ARM64_RECOMPILER_WINE_DEBUG is set.
     "__wine_dbg_get_channel_flags", "__wine_dbg_header", "__wine_dbg_strdup", "__wine_dbg_output",
 }
@@ -86,10 +96,16 @@ def syscall_number(image, rva):
 
 def system_overrides(name, image):
     """RVA -> runtime function name (None: return TRUE) for a liftable system DLL."""
-    if name.lower() != "ntdll.dll":
+    if name.lower() not in ("ntdll.dll", "win32u.dll"):
         return {}
     overrides = {}
     exports = getattr(image, "DIRECTORY_ENTRY_EXPORT", None)
+    if name.lower() == "win32u.dll":
+        # Every NtUser*/NtGdi* export is a syscall stub; its DllMain stays lifted.
+        for symbol in exports.symbols if exports else ():
+            if symbol.name and not symbol.forwarder and syscall_number(image, symbol.address) is not None:
+                overrides[symbol.address] = symbol.name.decode("ascii")
+        return overrides
     for symbol in exports.symbols if exports else ():
         if not symbol.name or symbol.forwarder:
             continue
@@ -126,9 +142,9 @@ def bound_import_dlls(image, available):
     return bound
 
 
-def lift_module(path, image, index, work, registry, load_base, trace=False, available=None):
+def lift_module(path, image, work, registry, load_base, trace=False, available=None):
     name = path.name
-    if not name.isascii() or len(name) > 128 or not name.lower().endswith(".dll"):
+    if not name.isascii() or len(name) > 128 or not name.lower().endswith((".dll", ".drv")):
         raise ValueError(f"unsupported DLL filename {name!r}")
     if not image.is_dll() or not image.OPTIONAL_HEADER.AddressOfEntryPoint:
         raise ValueError(f"{path}: expected a DLL with an entry point")
@@ -158,7 +174,7 @@ def lift_module(path, image, index, work, registry, load_base, trace=False, avai
             symbol = json.dumps(item.name.decode("ascii")) if item.name else "NULL"
             imports.append(f"    {{{json.dumps(target)}, {symbol}, {item.ordinal or 0}, {load_base + item.address - image_base}ULL}},")
 
-    tag = f"module_{index}"
+    tag = module_tag(name)
     entry, base, code, data = read_console_image(image, load_base=load_base)
     # Real system DLLs contain code the lifter cannot translate yet; trap there only if it runs.
     lifter = ConsoleLift(image, stub_unknown=False, tolerant=True, bound_dlls=bound, trace=trace,
@@ -181,6 +197,7 @@ def lift_module(path, image, index, work, registry, load_base, trace=False, avai
             export_rows.append(f"    {{{label}, {symbol.ordinal}, {load_base + symbol.address}ULL, NULL}},")
     registry.extend((
         f"extern const struct section {tag}_guest_sections[];",
+        f"extern unsigned char {tag}_guest_image[];",
         f"extern const struct guest_dispatch_entry {tag}_guest_dispatch_table[];",
         f"extern void {tag}_entry(void *, uint64_t);",
         f"static const struct guest_module_export {tag}_exports[] = {{",
@@ -189,18 +206,16 @@ def lift_module(path, image, index, work, registry, load_base, trace=False, avai
         f"static const struct guest_module_import {tag}_imports[] = {{",
         *imports,
         "};",
-        f"static const unsigned char {tag}_file[] = {{",
     ))
+    # The runtime checks that the DLL beside the program is the one lifted here.
     payload = bytes(image.__data__)
-    for offset in range(0, len(payload), 24):
-        registry.append("    " + ", ".join(map(str, payload[offset:offset + 24])) + ",")
-    registry.append("};")
+    digest = ", ".join(map(str, hashlib.sha256(payload).digest()))
     exception = image.OPTIONAL_HEADER.DATA_DIRECTORY[3]
     row = (
         f"{{.name = {json.dumps(name)}, .base = {load_base}ULL, "
         f".size = {image.OPTIONAL_HEADER.SizeOfImage}, "
         f".exception_rva = {exception.VirtualAddress}, .exception_size = {exception.Size}, "
-        f".file = {tag}_file, .file_size = sizeof {tag}_file, "
+        f".file_hash = {{{digest}}}, .file_size = {len(payload)}, .image = {tag}_guest_image, "
         f".sections = {tag}_guest_sections, .section_count = {len(data)}, "
         f".dispatch = {tag}_guest_dispatch_table, .dispatch_count = {len(lifter.functions)}, "
         f".exports = {tag}_exports, .export_count = {len(export_rows)}, .entry = {tag}_entry, "
@@ -209,7 +224,11 @@ def lift_module(path, image, index, work, registry, load_base, trace=False, avai
     return llvm, row
 
 
-def compile_parallel(sources, work, flags=("-O2",)):
+# Optimization level for the lifted DLLs and the runtime.
+MODULE_FLAGS = ("-O2",)
+
+
+def compile_parallel(sources, work, flags=MODULE_FLAGS):
     """Compile independent C / LLVM IR translation units to objects on all cores.
 
     Lifted modules are large single translation units; clang given several
@@ -231,65 +250,118 @@ def compile_parallel(sources, work, flags=("-O2",)):
         return list(pool.map(one, enumerate(sources)))
 
 
+# Guest images are mapped at their own guest addresses inside the host process
+# (the runtime's guest_map_fixed), so a base must be free there. On Apple
+# Silicon macOS the host executable and its heaps start at 4 GiB, the main
+# thread stack sits below 0x170000000, and the kernel reserves
+# 0x180000000-0x7000000000 for the dyld shared cache and a guard region
+# (vm_allocate there fails even where vmmap shows nothing).
+HOST_FREE_RANGES = ((0x140000000, 0x160000000), (1 << 40, 1 << 46))
+# Relocated images get a slot picked by their file name, so a DLL loads at the
+# same address in every program whatever else is linked beside it. Its lifted
+# object (which has the address baked in) is then reusable across programs.
+RELOCATION_BASE = 1 << 40
+RELOCATION_SLOT = 1 << 30
+RELOCATION_SLOTS = (HOST_FREE_RANGES[-1][1] - RELOCATION_BASE) // RELOCATION_SLOT
+
+
+def module_tag(name):
+    """Symbol prefix of a lifted DLL: a function of its file name only."""
+    lower = name.lower()
+    stem = "".join(c if c.isalnum() else "_" for c in lower)
+    return f"module_{stem}_{hashlib.sha256(lower.encode()).hexdigest()[:8]}"
+
+
 def module_range(path, image, ranges):
     preferred = image.OPTIONAL_HEADER.ImageBase
     size = image.OPTIONAL_HEADER.SizeOfImage
-    if 0x100000000 <= preferred and preferred + size <= 1 << 47 and all(
-        preferred >= high or preferred + size <= low for low, high in ranges
-    ):
+    def free(base):
+        return all(base >= high or base + size <= low for low, high in ranges)
+    if any(low <= preferred and preferred + size <= high for low, high in HOST_FREE_RANGES) and free(preferred):
         return preferred, preferred + size
-    if (image.FILE_HEADER.Characteristics & 1
-            or not getattr(image, "DIRECTORY_ENTRY_BASERELOC", ())):
+    # An image whose relocations were not stripped but has none needs no fixups.
+    if image.FILE_HEADER.Characteristics & 1:
         raise ValueError(f"{path}: image cannot be relocated from {preferred:#x}")
-    base = 0x100000000
-    for low, high in sorted(ranges):
-        if base + size <= low:
-            break
-        base = max(base, (high + 0xffff) & ~0xffff)
-    if base + size > 1 << 47:
-        raise ValueError(f"{path}: image exceeds the guest DLL address range")
-    return base, base + size
+    digest = hashlib.sha256(Path(path).name.lower().encode()).digest()
+    slot = int.from_bytes(digest[:8], "little") % RELOCATION_SLOTS
+    # The next free slot when another image or a live allocation holds this one.
+    for _ in range(RELOCATION_SLOTS):
+        base = RELOCATION_BASE + slot * RELOCATION_SLOT
+        if base + size <= HOST_FREE_RANGES[-1][1] and free(base):
+            return base, base + size
+        slot = (slot + 1) % RELOCATION_SLOTS
+    raise ValueError(f"{path}: image exceeds the guest DLL address range")
 
 
-def plugin_cache_key(path, base):
+def module_cache_key(path, image, base, available, trace, flags):
+    """Cache key for one lifted, compiled DLL of a linked build.
+
+    Everything the object depends on: the DLL's bytes and name (its symbol
+    prefix), where it loads, which of its imports bind to other lifted DLLs,
+    the lifter and build sources, and the compiler flags. Nothing about the
+    program or the DLLs it does not import, so programs share these objects.
+    """
     root = Path(__file__).resolve().parent
     hasher = hashlib.sha256(Path(path).read_bytes())
-    hasher.update(f"{Path(path).name.lower()}@{base}:{os.environ.get('ARM64_RECOMPILER_TRACE_MODULES', '')}".encode())
+    imports = sorted({resolve_api_set(dll.dll.decode("ascii", "replace"))
+                      for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ())} & set(available))
+    hasher.update(f"{Path(path).name.lower()}@{base}:{int(bool(trace))}:{imports}:{flags}".encode())
     for name in ("console_lift.py", "build_console_modules.py", "console_modules.h", "lift.py"):
         source = root / name
         if source.exists():
             hasher.update(source.read_bytes())
-    return hasher.hexdigest()[:20]
+    return hasher.hexdigest()[:24]
+
+
+def module_store():
+    """Folder of lifted DLLs built as shared libraries, shared by every program."""
+    # Outside the source tree by default: the store is per user, not per checkout,
+    # and a synced folder (iCloud Documents) may evict large libraries from disk.
+    store = os.environ.get("ARM64_RECOMPILER_MODULE_STORE")
+    return Path(store).resolve() if store else Path.home() / "Library/Caches/arm64-recompiler/modules"
+
+
+def module_library(path, image, base, available, trace, store):
+    """Lift one DLL into a shared library in the store, unless it is there already.
+
+    The library exports its struct guest_module as translated_guest_module and
+    takes the runtime's functions from the program that loads it. Programs
+    linked against it (build) and on-demand translation (build_plugin) share it.
+    """
+    key = module_cache_key(path, image, base, available, trace, MODULE_FLAGS)
+    library = store / f"module_{key}.dylib"
+    if library.exists():
+        return library
+    store.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".module-", dir=store) as folder:
+        work = Path(folder)
+        registry = ['#include "console_modules.h"']
+        llvm, row = lift_module(path, image, work, registry, base, trace=trace, available=available)
+        source = work / "registry.c"
+        source.write_text("\n".join((*registry, f"struct guest_module translated_guest_module = {row};", "")))
+        output = work / library.name
+        objects = compile_parallel([source, llvm], work)
+        subprocess.run(["clang", "-arch", "arm64", "-dynamiclib", "-undefined", "dynamic_lookup",
+                        "-install_name", f"@rpath/{library.name}",
+                        *map(str, objects), "-o", str(output)], check=True)
+        # Another build may have finished the same library meanwhile; either copy is right.
+        output.replace(library)
+    return library
 
 
 def build_plugin(path, output_path, ranges):
-    root = Path(__file__).resolve().parent
+    import shutil
     image = pefile.PE(str(path))
     base, _ = module_range(path, image, ranges)
-    cached = None
-    if not os.environ.get("ARM64_RECOMPILER_NO_CACHE"):
-        cache_dir = root / ".cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cached = cache_dir / f"plugin_{plugin_cache_key(path, base)}.dylib"
-        if cached.exists():
-            import shutil
-            shutil.copyfile(cached, output_path)
-            return
-    with tempfile.TemporaryDirectory(prefix=".console-plugin-", dir=output_path.parent) as folder:
-        work = Path(folder)
-        registry = ['#include "console_modules.h"']
-        trace = bool(os.environ.get("ARM64_RECOMPILER_TRACE_MODULES"))
-        llvm, row = lift_module(path, image, 0, work, registry, base, trace=trace)
-        source = work / "registry.c"
-        source.write_text("\n".join((*registry, f"struct guest_module translated_guest_module = {row};", "")))
-        output = work / "plugin.dylib"
-        objects = compile_parallel([source, llvm], work)
-        subprocess.run(["clang", "-arch", "arm64", "-dynamiclib", "-undefined", "dynamic_lookup",
-                        *map(str, objects), "-o", str(output)], check=True)
-        if cached:
-            import shutil
-            shutil.copyfile(output, cached)
-        output.replace(output_path)
+    # On-demand translation: the DLLs beside this one are the program's.
+    folder = Path(path).resolve().parent
+    available = {item.name.lower() for item in folder.iterdir() if item.suffix.lower() == ".dll"}
+    trace = bool(os.environ.get("ARM64_RECOMPILER_TRACE_MODULES"))
+    if os.environ.get("ARM64_RECOMPILER_NO_CACHE"):
+        with tempfile.TemporaryDirectory(prefix=".console-plugin-", dir=output_path.parent) as scratch:
+            shutil.copyfile(module_library(path, image, base, available, trace, Path(scratch)), output_path)
+    else:
+        shutil.copyfile(module_library(path, image, base, available, trace, module_store()), output_path)
 
 
 def cache_key(exe_path, dll_paths, lazy_modules, trace, bound=()):
@@ -337,17 +409,20 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
         key = cache_key(exe_path, dll_paths, lazy_modules, trace, bound)
         cached_o = cache_dir / f"{exe_path.stem}_{key}.o"
         cached_reg = cache_dir / f"{exe_path.stem}_{key}_reg.c"
-        if cached_o.exists() and (not dll_paths or cached_reg.exists()):
-            extra = [str(cached_reg)] if dll_paths else []
+        # Whole-program cache: only for builds without lifted DLLs, whose objects
+        # it does not hold (those have their own per-module cache below).
+        if cached_o.exists() and not dll_paths:
             subprocess.run(["clang", "-arch", "arm64", "-O2", "-Wno-override-module",
                             "-I", str(root), str(root / "console_runtime.c"),
-                            str(cached_o), *extra, "-o", str(output_path)], check=True)
+                            str(cached_o), "-o", str(output_path)], check=True)
             return
 
     with tempfile.TemporaryDirectory(prefix=".console-modules-", dir=output_path.parent) as folder:
         work = Path(folder)
         primary = work / "main.ll"
-        primary_image = read_console_image(exe)
+        # Pointers in the program's data are real guest addresses, like the ones its
+        # code computes: a stored pointer must compare equal to a computed one.
+        primary_image = read_console_image(exe, load_base=exe.OPTIONAL_HEADER.ImageBase)
         modules = [primary]
         exe_base = exe.OPTIONAL_HEADER.ImageBase
         ranges = [(exe_base, exe_base + 0x20000000)]
@@ -355,12 +430,71 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
         registry = ['#include "console_modules.h"']
         rows = []
         images = [(path, pefile.PE(str(path))) for path in dll_paths]
-        images.sort(key=lambda item: item[1].OPTIONAL_HEADER.ImageBase)
-        for index, (path, image) in enumerate(images):
+        # An order independent of the command line: it decides which image keeps
+        # a contested address.
+        images.sort(key=lambda item: (item[1].OPTIONAL_HEADER.ImageBase, item[0].name.lower()))
+        # Lifted DLLs normally stay out of the program: each is a shared library in
+        # the module store, loaded by the runtime at startup. Without a cache to
+        # keep them in, or on request, they are linked into the program instead.
+        shared = bool(images) and not no_cache and not os.environ.get("ARM64_RECOMPILER_STATIC_MODULES")
+        if shared:
+            store = module_store()
+            jobs = []
+            for path, image in images:
+                base, end = module_range(path, image, ranges)
+                if path.name.lower() in names:
+                    raise ValueError(f"{path}: duplicate DLL filename")
+                names.add(path.name.lower())
+                ranges.append((base, end))
+                jobs.append((path, image, base, available, False, store))
+            # Lifting is Python, but the compiles of uncached DLLs overlap.
+            with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+                libraries = list(pool.map(lambda job: module_library(*job), jobs))
+            lifter = ConsoleLift(exe, modules=True, trace=trace, fault_delivery=lazy_modules, bound_dlls=bound)
+            primary.write_text(lifter.emit_console(*primary_image))
+            source = work / "registry.c"
+            source.write_text("\n".join((
+                '#include "console_modules.h"',
+                f"static struct guest_module modules[{len(libraries)}];",
+                "struct guest_module *guest_modules = modules;",
+                f"const size_t guest_module_count = {len(libraries)};",
+                "static const char *const libraries[] = {",
+                *(f"    {json.dumps(library.name)}," for library in libraries),
+                "};",
+                "const char *const *guest_module_libraries = libraries;",
+                f"const char *guest_module_store = {json.dumps(str(store))};", "")))
+            primary_object = work / "main.o"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                primary_job = pool.submit(subprocess.run, ["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
+                                          "-c", str(primary), "-o", str(primary_object)], check=True)
+                objects = pool.submit(compile_parallel, [root / "console_runtime.c", source], work,
+                                      MODULE_FLAGS).result()
+                primary_job.result()
+            output = work / "runner"
+            subprocess.run(["clang", "-arch", "arm64", str(primary_object), *map(str, objects),
+                            "-o", str(output)], check=True)
+            output.replace(output_path)
+            return
+        pending = []  # (position in modules, cache object, cache metadata, metadata) of fresh lifts
+        for path, image in images:
             base, end = module_range(path, image, ranges)
             if path.name.lower() in names:
                 raise ValueError(f"{path}: duplicate DLL filename")
-            llvm, row = lift_module(path, image, index, work, registry, base, available=available)
+            # A lifted DLL compiles to the same object until the DLL, its base or
+            # the lifter changes: reuse it instead of lifting and compiling again.
+            module_key = module_cache_key(path, image, base, available, trace, MODULE_FLAGS)
+            cached_object = cache_dir / f"module_{module_key}.o"
+            cached_meta = cache_dir / f"module_{module_key}.json"
+            if not no_cache and cached_object.exists() and cached_meta.exists():
+                meta = json.loads(cached_meta.read_text())
+                registry.extend(meta["registry"])
+                llvm, row = cached_object, meta["row"]
+            else:
+                before = len(registry)
+                llvm, row = lift_module(path, image, work, registry, base, available=available)
+                if not no_cache:
+                    pending.append((len(modules), cached_object, cached_meta,
+                                    {"row": row, "registry": registry[before:]}))
             names.add(path.name.lower())
             ranges.append((base, end))
             modules.append(llvm)
@@ -383,15 +517,18 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
         with ThreadPoolExecutor(max_workers=2) as pool:
             primary_job = pool.submit(subprocess.run, ["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
                                       "-c", str(primary), "-o", str(primary_object)], check=True)
-            others = pool.submit(compile_parallel, [root / "console_runtime.c", *modules[1:]], work)
+            others = pool.submit(compile_parallel, [root / "console_runtime.c", *modules[1:]], work,
+                                 MODULE_FLAGS)
             primary_job.result()
             objects = others.result()
         modules[0] = primary_object
         if not no_cache:
             import shutil
             shutil.copyfile(primary_object, cached_o)
-            if source and source.exists():
-                shutil.copyfile(source, cached_reg)
+            for position, cached_object, cached_meta, meta in pending:
+                # objects[0] is the runtime; modules[position] compiled to objects[position].
+                shutil.copyfile(objects[position], cached_object)
+                cached_meta.write_text(json.dumps(meta))
         subprocess.run(["clang", "-arch", "arm64", str(primary_object), *map(str, objects),
                         "-o", str(output)], check=True)
         output.replace(output_path)

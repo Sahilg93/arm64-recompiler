@@ -73,7 +73,7 @@ EOF
 "$python" -m ziglang dlltool -m i386:x86-64 -d "$build/console-kernel32.def" \
     -l "$build/console-kernel32.lib"
 
-for variant in console console-variant console-flow console-flow-O0 console-flow-loop console-data console-atomic console-seto console-bits console-pcmpeq console-zcnt console-shufpd; do
+for variant in console console-variant console-flow console-flow-O0 console-flow-loop console-data console-atomic console-seto console-bits console-pcmpeq console-zcnt console-shufpd console-pack; do
     prefix="$build/$variant"
     source=console.c
     optimization=-O2
@@ -104,6 +104,9 @@ for variant in console console-variant console-flow console-flow-O0 console-flow
     elif [[ "$variant" == console-shufpd ]]; then
         source=console_shufpd.c
         message="shufpd passed"
+    elif [[ "$variant" == console-pack ]]; then
+        source=console_pack.c
+        message="pack and bit tests passed"
     elif [[ "$variant" == console-flow* ]]; then
         source=console_flow.c
         if [[ "$variant" == console-flow-O0 ]]; then
@@ -168,6 +171,12 @@ fixtures/jit/test.sh
 
 # Real system DLLs below the CRT: Wine's ntdll.dll and kernelbase.dll lifted as guest modules.
 fixtures/ntdll/test.sh
+
+# A lifted Win32 GUI program on Wine's native windowing stack (needs wine-host/build.sh output).
+fixtures/gui/test.sh
+
+# A lifted Winsock client on Wine's lifted ws2_32.dll and native socket stack.
+fixtures/winsock/test.sh
 
 # MSVC C++ EH and __try/__except, compared with Wine. Needs clang-cl and an xwin SDK.
 if [[ -z "${XWIN_SDK:-}" && -d "$repository/work/xwin-sdk/crt" ]]; then

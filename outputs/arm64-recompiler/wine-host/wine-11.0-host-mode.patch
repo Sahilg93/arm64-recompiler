@@ -1,0 +1,160 @@
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -46,7 +46,7 @@
+ #define QS_HARDWARE     0x40000000
+ #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
+ 
+-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
++static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x17ffe0000ull;
+ 
+ static LONG atomic_load_long( const volatile LONG *ptr )
+ {
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -106,6 +106,7 @@
+ void *pKiUserExceptionDispatcher = NULL;
+ void *pKiUserApcDispatcher = NULL;
+ void *pKiUserCallbackDispatcher = NULL;
++DECLSPEC_EXPORT struct wine_host_callbacks *__wine_host = NULL;
+ void *pKiUserEmulationDispatcher = NULL;
+ void *pLdrInitializeThunk = NULL;
+ void *pRtlUserThreadStart = NULL;
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1128,6 +1128,11 @@
+     thread_data->pthread_id = pthread_self();
+     pthread_setspecific( teb_key, teb );
+     server_init_thread( thread_data->start, &suspend );
++    if (__wine_host)
++    {
++        __wine_host->start_thread( thread_data->start, thread_data->param, suspend, teb );
++        pthread_exit( NULL );
++    }
+     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
+ }
+ 
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1741,7 +1741,9 @@
+     close( initial_cwd );
+ 
+ #ifdef __APPLE__
+-    send_server_task_port();
++    /* host mode: an arm64 task port is of no use to a server that expects x86-64 thread
++     * state, and the x86-64 wineserver crashes cleaning up after it */
++    if (!__wine_host) send_server_task_port();
+ #endif
+ 
+     /* Install signal handlers; this cannot be done earlier, since we cannot
+@@ -1765,6 +1767,11 @@
+     SERVER_END_REQ;
+ 
+     assert( !status );
++    if (__wine_host)
++    {
++        __wine_host->start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
++        _exit( 0 );
++    }
+     signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
+ }
+ 
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -971,7 +971,10 @@
+  */
+ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
+ {
+-    struct syscall_frame *frame = get_syscall_frame();
++    struct syscall_frame *frame;
++
++    if (__wine_host) return __wine_host->user_callback( id, args, len, ret_ptr, ret_len );
++    frame = get_syscall_frame();
+     ULONG64 sp = (frame->sp - offsetof( struct callback_stack_layout, args_data[len] ) - 16) & ~15;
+     struct callback_stack_layout *stack = (struct callback_stack_layout *)sp;
+ 
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -202,7 +202,7 @@
+ static struct file_view *arm64ec_view;
+ 
+ ULONG_PTR user_space_wow_limit = 0;
+-struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
++struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x17ffe0000ull;
+ 
+ /* TEB allocation blocks */
+ static void *teb_block;
+@@ -239,6 +239,7 @@
+ static void *preload_reserve_start;
+ static void *preload_reserve_end;
+ static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
++static const UINT_PTR host_search_start = (UINT_PTR)1 << 41;  /* host mode: 2 TiB, see map_view */
+ static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
+ 
+ struct range_entry
+@@ -1358,7 +1359,8 @@
+         if (vprot & VPROT_READ) prot |= PROT_READ;
+         if (vprot & VPROT_WRITE) prot |= PROT_WRITE | PROT_READ;
+         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
+-        if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
++        /* host mode never executes guest pages natively (and macOS arm64 refuses to make them executable) */
++        if (vprot & VPROT_EXEC) prot |= (__wine_host ? 0 : PROT_EXEC) | PROT_READ;
+         if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+     }
+     if (!prot) prot = PROT_NONE;
+@@ -2292,6 +2294,13 @@
+         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
+         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+ 
++        /* host mode: the embedding executable, its heaps and libraries sit just above
++         * 4 GiB. A search for free space that starts there probes its way through all of
++         * them (seconds for a large executable); start in empty address space instead. */
++        if (__wine_host && !top_down && (char *)start < (char *)host_search_start &&
++            (char *)end > (char *)host_search_start + view_size)
++            start = (void *)host_search_start;
++
+         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+         {
+             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+@@ -4051,7 +4060,7 @@
+         exit(1);
+     }
+ 
+-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
++    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, 0, &total,
+                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+     teb_block_pos = 30;
+     ptr = (char *)teb_block + 30 * block_size;
+@@ -4660,6 +4669,8 @@
+     for (i = 0; i < size; i += host_page_size)
+     {
+         BYTE vprot = get_host_page_vprot( addr + i );
++        /* host mode: the embedding runtime owns memory (guest stacks, heaps, images) that has no view here */
++        if (__wine_host && !vprot) continue;
+         if (vprot & VPROT_WRITEWATCH) *has_write_watch = TRUE;
+         if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
+             return STATUS_INVALID_USER_BUFFER;
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -48,8 +48,21 @@
+ #elif defined(__arm__)
+ static const WORD current_machine = IMAGE_FILE_MACHINE_ARMNT;
+ #elif defined(__aarch64__)
+-static const WORD current_machine = IMAGE_FILE_MACHINE_ARM64;
++/* Host mode: the Windows side is x86-64 code run by an embedding recompiler,
++ * so this process presents itself to the server as an x86-64 process. */
++static const WORD current_machine = IMAGE_FILE_MACHINE_AMD64;
+ #endif
++
++/* Host mode: callbacks supplied by the embedding runtime (set through the
++ * exported __wine_host pointer before __wine_main). */
++struct wine_host_callbacks
++{
++    /* runs a thread's Windows-side entry point; never returns */
++    void (*start_thread)( void *entry, void *arg, int suspend, void *teb );
++    /* replaces the jump to KiUserCallbackDispatcher */
++    NTSTATUS (*user_callback)( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len );
++};
++extern struct wine_host_callbacks *__wine_host;
+ extern WORD native_machine;
+ 
+ static const BOOL is_win64 = (sizeof(void *) > sizeof(int));

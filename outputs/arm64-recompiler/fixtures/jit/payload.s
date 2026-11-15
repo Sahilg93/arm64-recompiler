@@ -185,6 +185,41 @@ jit_ops:
     pushq $0x77
     popq %rax
 2:  movq %rax, 264(%rbx)
+    # 34..49: SSE2 shifts by an immediate, two results (low, high) per step:
+    # psrldq, pslldq, psrlq+psllq, psrld+pslld, psrlw+psllw, psraw, psrad past
+    # the element width (fills with the sign), psrlq by 64 (clears).
+    movabsq $0x8877665544332211, %rax
+    movq %rax, 272(%rbx)
+    movabsq $0xffeeddccbbaa9900, %rax
+    movq %rax, 280(%rbx)
+    movdqu 272(%rbx), %xmm2
+    movdqa %xmm2, %xmm1
+    psrldq $5, %xmm1
+    movdqu %xmm1, 272(%rbx)
+    movdqa %xmm2, %xmm9
+    pslldq $3, %xmm9
+    movdqu %xmm9, 288(%rbx)
+    movdqa %xmm2, %xmm1
+    psrlq $4, %xmm1
+    psllq $8, %xmm1
+    movdqu %xmm1, 304(%rbx)
+    movdqa %xmm2, %xmm1
+    psrld $4, %xmm1
+    pslld $12, %xmm1
+    movdqu %xmm1, 320(%rbx)
+    movdqa %xmm2, %xmm9
+    psrlw $4, %xmm9
+    psllw $1, %xmm9
+    movdqu %xmm9, 336(%rbx)
+    movdqa %xmm2, %xmm1
+    psraw $3, %xmm1
+    movdqu %xmm1, 352(%rbx)
+    movdqa %xmm2, %xmm1
+    psrad $36, %xmm1
+    movdqu %xmm1, 368(%rbx)
+    movdqa %xmm2, %xmm1
+    psrlq $64, %xmm1
+    movdqu %xmm1, 384(%rbx)
 
     addq $32, %rsp
     popq %rdi
