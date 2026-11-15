@@ -301,3 +301,11 @@ Rather than writing a replacement for the Windows GUI subsystems (USER32, GDI, D
 - [Corpus Audit Notes](recompiler/CORPUS.md): analysis of the external Windows release binaries, including PuTTY's download link and SHA-256.
 - [Export Lifting Experiments](recompiler/EXPORTS.md): function-level translation for SQLite and xxHash DLL exports.
 - [Wine Reference Setup](recompiler/WINDOWS.md): setup notes for the comparison baseline.
+
+## License
+
+The recompiler is released under the [MIT License](LICENSE). Two parts of the repository are not:
+
+- [`recompiler/wine-host/wine-11.0-host-mode.patch`](recompiler/wine-host/wine-11.0-host-mode.patch) modifies Wine and is under Wine's licence, the LGPL 2.1 or later. Lifted Wine DLLs you build are derived from Wine and carry the same obligations if you distribute them.
+- The binaries in [`work/corpus/`](work/corpus/) are unmodified third-party releases (PuTTY Plink, jq, ripgrep) under their own licences, included for reproduction.
+
