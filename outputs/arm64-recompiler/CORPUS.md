@@ -95,3 +95,40 @@ The lifter now tracks the signed condition used by JL, JGE, JG, and JLE
 and supports immediate indices for register BT. The native console suite
 checks a signed comparison. Plink now lifts to XGETBV at RVA 0x857ad.
 This is a translation diagnostic. Plink has not run as a lifted executable.
+
+## PuTTY GUI and hosted SSH follow-up
+
+The corpus gained a GUI program: the PuTTY 0.83 Windows x64 executable. It is
+not redistributed in this repository. Download it and check the fingerprint,
+which matches the `sha256sums` file the PuTTY project publishes for 0.83:
+
+- [PuTTY 0.83 Windows x64 GUI executable](https://the.earth.li/~sgtatham/putty/0.83/w64/putty.exe)
+- SHA-256 `16cbe40fb24ce2d422afddb5a90a5801ced32ef52c22c2fc77b25a90837f28ad`, 1,709,672 bytes
+
+It imports `GDI32`, `IMM32`, `ole32`, `USER32`, `KERNEL32`, `SHELL32`,
+`COMDLG32` and `ADVAPI32`, and loads Winsock at run time. In hosted mode
+(`wine-host/lift_app.py`, see the README) it is lifted with 48 of Wine's DLLs.
+
+What runs, checked against a local OpenSSH 10.5 server on the loopback
+interface with throwaway keys:
+
+- The configuration dialog renders (tree view, edit fields, combo box, list box).
+- A raw TCP session and an SSH session open a terminal window and show the
+  remote output. SSH used NTRU Prime / Curve25519 hybrid key exchange with
+  SHA-512, an Ed25519 host key and client key, and AES-256 SDCTR with
+  HMAC-SHA-256.
+- Plink, hosted the same way, logs in with a public key, runs a remote command,
+  prints its output and exits with status 0.
+
+What does not:
+
+- PuTTY's hardware-accelerated paths (AES-NI, SHA extensions, carry-less
+  multiply) are not lifted. The synthetic CPU profile reports none of those
+  features, so PuTTY selects its software implementations; the unlifted code
+  traps if it is ever reached.
+- Lifting PuTTY needs `--trace`, which accepts code the lifter cannot
+  translate and compiles the program's own code without optimization.
+- Only public-key login was exercised. Password and keyboard-interactive
+  login, port forwarding, and the other backends (serial, Telnet, Rlogin,
+  SUPDUP) were not.
+

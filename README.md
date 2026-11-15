@@ -6,9 +6,13 @@ The primary whole-program milestone is the original Windows release of **PuTTY P
 
 The second milestone is real GUI and network software. The original Windows release of the **PuTTY 0.83 GUI** runs lifted on ARM64: its configuration dialog renders, and it opens raw and **SSH** terminal sessions (hybrid NTRU Prime / Curve25519 key exchange, Ed25519 public-key login, AES-256). Wine's own Task Manager runs the same way. These programs are hosted on Wine's unix side: the program and Wine's x86-64 Windows DLLs (`user32`, `gdi32`, `comctl32`, `ws2_32`, and the rest) are lifted to ARM64, and only the syscall layer (`ntdll.so`, `win32u.so`, `winemac.so`, `ws2_32.so`) is Wine's native code.
 
-| PuTTY configuration dialog | PuTTY terminal session |
+| PuTTY configuration dialog | PuTTY SSH session |
 | --- | --- |
-| ![Lifted PuTTY configuration dialog](outputs/arm64-recompiler/docs/putty-config.png) | ![Lifted PuTTY terminal session](outputs/arm64-recompiler/docs/putty-terminal.png) |
+| ![Lifted PuTTY configuration dialog](outputs/arm64-recompiler/docs/putty-config.png) | ![Lifted PuTTY SSH session](outputs/arm64-recompiler/docs/putty-ssh.png) |
+| **PuTTY raw TCP session** | **Wine Task Manager** |
+| ![Lifted PuTTY raw terminal session](outputs/arm64-recompiler/docs/putty-terminal.png) | ![Lifted Wine Task Manager](outputs/arm64-recompiler/docs/taskmgr.png) |
+
+The text in the two terminal windows was sent by the test server (a local OpenSSH server and a local TCP server).
 
 ---
 
@@ -40,6 +44,10 @@ Check out [**`WAR_STORIES.md`**](WAR_STORIES.md) for an honest, detailed breakdo
 5. **The Modern Windows API-Set Prefix Maze** (Navigating schema-based virtual DLL indirection in MSVC/Rust).
 6. **The UCRT `_iobuf` / `FILE*` Memory Impass** (Why fake stream handles crash guest code and how bounded `_iobuf` tables fixed it).
 7. **Virtual Memory Protection Translation** (Mapping Win32 page protection bitmasks to POSIX `mprotect`).
+8. **The Pointer That Was Not Equal to Itself** (Why PuTTY's key exchange asserted: stored pointers were image-relative, computed ones were not).
+9. **The Function That Returned Halfway Through** (MSVC's chained unwind ranges, and a jump the lifter emitted as a return).
+10. **Critical Sections That Were Not Locks** (The single-threaded shortcut that Plink's input thread broke).
+11. **The Build Machine That Deleted the Source** (iCloud evicting source files and built libraries mid-session).
 
 ---
 
@@ -158,6 +166,19 @@ Measurements taken on Apple Silicon across 30 runs per variant (after 2 warmups)
 
 Both the recompiled ARM64 executable and Wine + Rosetta matched stdout byte-for-byte and exited with status 0.
 
+### Hosted Programs (PuTTY GUI and Plink over SSH)
+
+Measured on an Apple M1, five runs per variant after one warm-up. Every run starts from a stopped `wineserver`, so its start-up is included in both columns. Memory is the resident size of the program's own process.
+
+| Measurement | Lifted ARM64 (hosted) | Original under Wine + Rosetta | Ratio |
+| --- | ---: | ---: | ---: |
+| PuTTY: launch to configuration window (min / median / max) | **1642 / 1672 / 1736 ms** | 1896 / 1936 / 2105 ms | 1.16× faster |
+| PuTTY: resident memory with the dialog open | 127 MB | 59 MB | 2.2× more |
+| Plink: SSH login, `echo`, exit (min / median / max) | 6295 / 6348 / 6497 ms | **5744 / 5803 / 5935 ms** | 0.91× (slower) |
+| Plink: peak resident memory | 41.7 MB | 22.7 MB | 1.8× more |
+
+The lifted GUI reaches its window sooner, but the SSH command is slower and both use about twice the memory. Two known causes: programs lifted with `--trace` (PuTTY and Plink need it) have their own code compiled without optimization, which is where the key-exchange arithmetic runs, and every linked DLL is loaded at startup whether it is used or not.
+
 ---
 
 ## Architecture & Lifter Capabilities
@@ -203,7 +224,7 @@ The long-term vision for this project is to expand beyond console utilities and 
 The GUI half of this plan now exists as hosted mode (see the quickstart). It goes one step further than thunking into Wine: Wine's Windows-side DLLs are lifted along with the program, and only Wine's unix-side syscall layer runs as native code. Current limits:
 
 - Wine's `wineserver` and its helper processes are still the x86-64 install's own, so they run under Rosetta, and a Wine prefix is required. There is no standalone `.app` bundle yet.
-- Every linked DLL is loaded at startup, used or not. PuTTY takes several seconds to show its window.
+- Every linked DLL is loaded at startup, used or not, and programs lifted with `--trace` run their own code unoptimized (see the hosted measurements above).
 - `DLL_THREAD_ATTACH` is not delivered to threads Wine creates.
 - Instruction coverage is still driven by the programs tried so far: AES-NI, SHA, carry-less multiply and AVX are not lifted.
 - Direct3D and the "Metal thunking" part of the diagram are not started.

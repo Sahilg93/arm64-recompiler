@@ -216,17 +216,90 @@ We also tracked previously applied protections to properly populate the `lpflOld
 
 ---
 
-## 8. Summary of Hard-Won Lessons
+## 8. The Pointer That Was Not Equal to Itself (PuTTY's Key Exchange)
+
+### The Failure
+Lifted Plink connected to an OpenSSH server, exchanged version strings, and then died on one of PuTTY's own assertions:
+```
+Assertion failed: false && "don't have a name for this classical alg", file .../crypto/kex-hybrid.c, line 44
+```
+The code behind it is a plain chain of pointer comparisons: `if (alg->classical == &ssh_ec_kex_curve25519) ... else if (... == &ssh_ec_kex_nistp256) ...`. Every comparison failed, although the static data was correct.
+
+### The Root Cause
+A debugger showed the pointer in `rcx` was `0xc1de0`: an image-relative address with no image base. The lifter had inherited an early design in which the main program's addresses were RVAs. Code had since moved to real guest addresses (`lea` yields image base + RVA), but the loader step that applies base relocations to the program's *data* still rewrote every stored pointer to an RVA. The runtime accepts both forms when it reads memory, so loads and calls through such pointers worked and nothing noticed.
+
+What cannot work is equality. A pointer read from a static table (an RVA) never equals the address the code computes for the same object (a real address).
+
+### The Fix
+`build_console_modules.py` now relocates the program's data to its real load address, exactly as lifted DLLs already were. Any program that compares a stored pointer with a computed one was affected; PuTTY was simply the first to assert on it.
+
+---
+
+## 9. The Function That Returned Halfway Through (Chained Unwind Ranges)
+
+### The Failure
+The PuTTY GUI opened its configuration dialog, but starting a session aborted with the runtime's stack check:
+```
+guest return address mismatch
+actual 0x104f5b230 != expected 0x140035137 at rsp 0x104f5b050
+```
+A function had returned without running its epilogue.
+
+### The Root Cause
+The culprit was an SSE2 string routine from the MSVC CRT. Two things had to line up to expose it.
+
+First, the routine dispatches through a jump table in the standard MSVC form: a table of image-relative addresses, `mov ecx, [rbase + index*4 + table]; add rcx, rbase; jmp rcx`. The lifter did not recognise that form, so the jump fell into the fallback x86 interpreter, which stopped on the first `psrldq`. That failure hid everything behind it.
+
+Second, once the table was recovered and the routine ran as lifted code, the real bug appeared. MSVC splits one function into several unwind ranges (`.pdata` entries) that jump into each other's middles. The lifter bounds each lifted function by its unwind range, and a jump that left the range to an address that was not a known function start was emitted as *return to caller*. A conditional branch into the next fragment therefore became a `ret` with 0x28 bytes still on the stack.
+
+### The Fix
+- `find_switch_tables` recovers the MSVC image-relative table, including when the image-base register was loaded in a parent fragment.
+- A jump into the middle of another unwind range now lifts the rest of that range as a function of its own and tail-calls it.
+- The return-address check reports the last traced guest address. That single line is what located the bug.
+
+---
+
+## 10. Critical Sections That Were Not Locks
+
+### The Failure
+Plink's raw TCP session printed the server's greeting and then aborted with `unsupported critical section ownership state`.
+
+### The Root Cause
+The runtime's `EnterCriticalSection` updated the owner and recursion fields in guest memory and trapped if another thread already owned the section. That was a deliberate early simplification, and it held as long as no two threads ever wanted the same section at once. Plink reads standard input on a second thread, and in a live session that thread and the main thread met on one section.
+
+### The Fix
+Critical sections are real locks. The owner field is claimed with a compare-and-swap directly in guest memory, so the uncontended path takes no host lock. A thread that finds the section owned waits on a shared condition variable, which a leaving owner signals only when a waiter is registered. `TryEnterCriticalSection` uses the same compare-and-swap and no longer races between its check and its enter.
+
+---
+
+## 11. The Build Machine That Deleted the Source
+
+### The Failure
+In the middle of a session, `grep` on a 270 KB source file hung forever. So did `clang`, and then the lifted program itself, silently, before printing anything.
+
+### The Root Cause
+The repository lived in an iCloud-synced `Documents` folder on a nearly full disk. macOS had uploaded files and evicted the local copies: `ls -lO` showed `console_runtime.c`, `console_lift.py` and one of the freshly built module libraries as `dataless`. Any read blocks until the file is downloaded again, and `dlopen` of an evicted library blocks the same way.
+
+### The Fix
+`brctl download <file>` brings a file back. The shared module store moved out of the source tree to `~/Library/Caches/arm64-recompiler/modules`: it is a per-user cache of large binaries, which is exactly what a sync service evicts first. The lesson is not specific to this project, but it meant chasing a "hang" in code that was never running.
+
+---
+
+## 12. Summary of Hard-Won Lessons
 
 1. **Don't guess indirect branch targets; parse the PE exception unwinding metadata.** The compiler already wrote down every valid function entry in `.pdata`.
 2. **Never skip TLS callbacks.** Modern compilers treat TLS callbacks as a required pre-entry execution phase.
 3. **x86 arithmetic flags have subtle side-effects.** Lowering atomic instructions requires full flag emulation, not just boolean success checks.
 4. **API-set indirection is mandatory for modern Windows binaries.** Supporting `KERNEL32.dll` alone is insufficient for binaries compiled after 2015.
 5. **Always back emulated handles with real guest memory.** If guest code receives a pointer from a CRT shim, it will inevitably attempt to dereference it.
+6. **A pointer has one representation.** Accepting two forms of the same address on reads hides the bug until something compares them.
+7. **An unwind range is not a function.** MSVC splits functions into chained ranges; a jump out of one is a jump, not a return.
+8. **A simplification that traps is a debt with a due date.** The single-threaded critical section was fine until the first second thread.
+9. **Make the failure name the place.** Reporting the last traced address on a stack mismatch, and the name of an unimplemented stub, turned hour-long hunts into single runs.
 
 ---
 
-## 9. The Next Frontier: The Hybrid Architecture (Why Re-inventing USER32 is the Wrong Move)
+## 13. The Next Frontier: The Hybrid Architecture (Why Re-inventing USER32 is the Wrong Move)
 
 As this recompiler matures from console binaries (`plink`, `jq`, `rg`) toward desktop software with graphical interfaces, the question arises: *Do we need to rewrite all of Windows USER32, GDI, and DirectX?*
 
@@ -237,3 +310,5 @@ In the compatibility and emulation world (from Apple's Rosetta 2 + D3DMetal in t
 - **Thunk the Periphery**: Forward complex Windows API boundaries (window creation, message dispatch loops, bitmap blits, and 3D rendering) across a thunking bridge to mature implementations like Wine, or translate DirectX calls to native Apple Metal.
 
 This division of labor plays to each component's strengths: the recompiler delivers peak raw CPU performance on Apple Silicon, while established compatibility layers handle the immense surface area of Windows desktop windowing and display drivers.
+
+**Update:** the GUI half now exists as hosted mode (`wine-host/`). It goes further than thunking: Wine's Windows-side DLLs are lifted with the program, and only Wine's unix-side syscall layer runs as native code. Stories 8 to 11 above come from getting the PuTTY GUI and SSH working on it.
