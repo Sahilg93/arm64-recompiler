@@ -166,6 +166,9 @@ fixtures/vm_fault/test.sh
 # Runtime-generated code: interpreted PAGE_EXECUTE* buffers, RWX patching, DEP faults.
 fixtures/jit/test.sh
 
+# Real system DLLs below the CRT: Wine's ntdll.dll and kernelbase.dll lifted as guest modules.
+fixtures/ntdll/test.sh
+
 # MSVC C++ EH and __try/__except, compared with Wine. Needs clang-cl and an xwin SDK.
 if [[ -z "${XWIN_SDK:-}" && -d "$repository/work/xwin-sdk/crt" ]]; then
     export XWIN_SDK="$repository/work/xwin-sdk"

@@ -26,10 +26,11 @@ Exercises 11,121 arithmetic & control-flow instruction permutations, atomic `loc
 ```sh
 PYTHON="$PWD/work/venv/bin/python3" outputs/arm64-recompiler/run.sh
 ```
-It also runs the virtual-memory test (`test_mmap.c`) and four fixtures:
+It also runs the virtual-memory test (`test_mmap.c`) and five fixtures:
 - `fixtures/vm_fault`: raw `VirtualAlloc` faults reach VEH and table-driven SEH handlers, including a resumption in the middle of a function.
 - `fixtures/jit`: runtime-generated code in `PAGE_EXECUTE*` buffers runs in the fallback x86 interpreter, plus RWX patching and DEP faults.
 - `fixtures/exception/test_msvc.sh`: MSVC C++ EH and `__try`/`__except`.
+- `fixtures/ntdll`: Wine's x64 `ntdll.dll` and `kernelbase.dll` are lifted as guest modules when they are shipped beside the program. Wine's own `Rtl*`, path, string and locale code runs as lifted code, including kernelbase's real `DllMain`. ntdll exports that own process-wide state stay in the runtime, so heaps, last error, locks, TLS/FLS, the loader and exceptions are shared with the runtime's kernel32. Those exports are the syscall stubs plus the list in `NTDLL_RUNTIME_EXPORTS` in `build_console_modules.py`. Unimplemented syscalls return `STATUS_NOT_IMPLEMENTED`. kernelbase reads Wine's NLS tables from `ARM64_RECOMPILER_NLS_DIR`, which the fixture sets to Wine's `share/wine/nls`.
 - `fixtures/crt`: Wine's real x64 `ucrtbase.dll` is lifted and loaded in place of the runtime's CRT shims. This covers API sets, ordinal imports, forwarded exports, and `DllMain` attach/detach order. It needs the same SDK tools as the MSVC case, plus a `ucrtbase.dll` from Wine.
 
 The fixtures compare against Wine when it is installed (`setup_wine.py`, or `WINE`/`WINEPREFIX`). The MSVC case needs an xwin SDK (`XWIN_SDK`) and LLVM `clang-cl`/`lld-link`. Without them it prints `SKIP`, or fails if `REQUIRE_MSVC=1`.

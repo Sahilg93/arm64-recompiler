@@ -1,0 +1,6 @@
+LIBRARY kernelbase.dll
+EXPORTS
+PathFindFileNameW
+PathIsRelativeW
+StrToIntW
+PathCchCombine

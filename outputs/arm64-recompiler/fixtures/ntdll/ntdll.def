@@ -1,0 +1,18 @@
+LIBRARY ntdll.dll
+EXPORTS
+RtlInitUnicodeString
+RtlUnicodeStringToAnsiString
+RtlFreeAnsiString
+RtlCompareUnicodeString
+RtlCharToInteger
+RtlTimeToTimeFields
+RtlNtStatusToDosError
+RtlAllocateHeap
+RtlGetLastWin32Error
+_snprintf
+NtQuerySystemTime
+NtAllocateVirtualMemory
+NtFreeVirtualMemory
+NtCreateKeyedEvent
+LdrGetDllHandle
+LdrGetProcedureAddress

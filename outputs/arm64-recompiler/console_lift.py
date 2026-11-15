@@ -64,8 +64,13 @@ def imported_calls(image):
 
 class ConsoleLift(Lift):
     def __init__(self, image, *, trace=False, callback_targets=None, stub_unknown=True, modules=False,
-                 fault_delivery=False, tolerant=False, bound_dlls=None):
+                 fault_delivery=False, tolerant=False, bound_dlls=None, overrides=None):
         super().__init__()
+        # RVA -> runtime function name: the lifted body becomes a call to the
+        # runtime's named implementation (None: return TRUE). Used for system
+        # DLLs whose syscalls and process-global state the runtime owns.
+        self.overrides = dict(overrides or {})
+        self.override_caches = []
         self.trace = trace
         # Tolerant lifting turns undecodable or unsupported instructions into
         # runtime traps (like trace mode) without per-instruction PC updates.
@@ -1120,6 +1125,15 @@ class ConsoleLift(Lift):
             op = op.removeprefix("lock ")
         if op == "ud2":
             self.trap(f"RVA {ins.address:#x}: ud2 instruction")
+            return
+        # Lifted code runs on the host FPU; control words read back as the
+        # Windows x64 defaults and loads are accepted (setjmp, CRT FP setup).
+        if op in {"stmxcsr", "vstmxcsr", "fnstcw"} and args and args[0].type == x.X86_OP_MEM:
+            self.write(ins, args[0], "8064" if op != "fnstcw" else "895")
+            self.jump(following, returns)
+            return
+        if op in {"ldmxcsr", "vldmxcsr", "fldcw"}:
+            self.jump(following, returns)
             return
         if op == "int" and args and args[0].type == x.X86_OP_IMM and args[0].imm == 0x29:
             self.trap(f"RVA {ins.address:#x}: fast fail (int 29h)")
@@ -2491,6 +2505,9 @@ class ConsoleLift(Lift):
     def emit_functions(self, base, code):
         while self.function_queue:
             target = self.function_queue.pop()
+            if target in self.overrides:
+                self.emit_override(target, self.overrides[target])
+                continue
             self.current = target
             self.blocks, self.pending = {}, []
             self.zero = self.carry = self.signed = self.overflow = False
@@ -2615,6 +2632,30 @@ class ConsoleLift(Lift):
                 self.line("  ret void")
                 self.line("}")
 
+    def emit_override(self, target, name):
+        """Emit a function whose body calls the runtime's implementation of name."""
+        self.line(f"define internal void @{self.functions[target]}(ptr %cpu, i64 %return_va) {{")
+        self.line("entry:")
+        if name is None:
+            self.line("  store i64 1, ptr %cpu")
+        else:
+            cache = f"@guest_override_cache_{target:x}"
+            self.override_caches.append(cache)
+            label = self.string_constant(name)
+            for index, register in enumerate(("rcx", "rdx", "r8", "r9"), 1):
+                self.line(f"  %{register}_ptr = getelementptr inbounds i64, ptr %cpu, i64 {index}")
+                self.line(f"  %{register} = load i64, ptr %{register}_ptr")
+            self.line(f"  %res = call i64 @guest_named_call(ptr {cache}, ptr @{label}, "
+                      "i64 %rcx, i64 %rdx, i64 %r8, i64 %r9)")
+            self.line("  store i64 %res, ptr %cpu")
+        self.line("  %rsp_ptr = getelementptr inbounds i64, ptr %cpu, i64 7")
+        self.line("  %rsp = load i64, ptr %rsp_ptr")
+        self.line("  call void @guest_check_return(i64 %rsp, i64 %return_va)")
+        self.line("  %rsp_new = add i64 %rsp, 8")
+        self.line("  store i64 %rsp_new, ptr %rsp_ptr")
+        self.line("  ret void")
+        self.line("}")
+
     def cpu_pointers(self):
         count = len(self.cpu_slots)
         for i, name in enumerate(self.cpu_slots):
@@ -2694,6 +2735,10 @@ class ConsoleLift(Lift):
 
     def finish_module(self, prefix=""):
         self.line("declare i64 @guest_indirect_dispatch(ptr, i64, i64, i32)")
+        if self.overrides:
+            self.line("declare i64 @guest_named_call(ptr, ptr, i64, i64, i64, i64)")
+        for cache in getattr(self, "override_caches", ()):
+            self.line(f"{cache} = internal global i64 0")
         entries = sorted(self.functions.keys())
         table_kind = f"[{len(entries)} x {{ i64, ptr }}]"
         table_items = [f"{{ i64, ptr }} {{ i64 {addr + self.module_base}, ptr @{self.functions[addr]} }}" for addr in entries]

@@ -190,7 +190,8 @@ static void init_runtime_data(void) {
 static void put64(unsigned char *data, unsigned offset, uint64_t value) {
     memcpy(data + offset, &value, sizeof value);
 }
-static _Thread_local uint32_t last_error;
+/* Win32 last error lives in TEB->LastErrorValue, where lifted Wine code reads it inline. */
+#define last_error (*(uint32_t *)(void *)(teb + 0x68))
 
 static bool fits(uint64_t addr, uint64_t size, uint64_t start, uint64_t length) {
     return addr >= start && size <= length && addr - start <= length - size;
@@ -626,7 +627,33 @@ static void module_string(char *text, size_t capacity, uint64_t address, unsigne
     guest_trap("unterminated module or procedure name");
 }
 
+static bool is_lifted_system_dll(const char *resolved);
+
+/* A loaded (referenced) application module by file name, or NULL. */
+static struct guest_module *loaded_module_named(const char *name) {
+    char buffer[160];
+    const char *dot = strrchr(name, '.');
+    if (!dot || strcasecmp(dot, ".dll")) {
+        snprintf(buffer, sizeof buffer, "%s.dll", name);
+        name = buffer;
+    }
+    for (size_t i = 0; i < guest_module_count; ++i)
+        if (guest_modules[i].references && !strcasecmp(guest_modules[i].name, name))
+            return &guest_modules[i];
+    for (struct translated_module *item = atomic_load(&translated_modules); item; item = item->next)
+        if (item->module->references && !strcasecmp(item->module->name, name))
+            return item->module;
+    return NULL;
+}
+
 static bool is_kernel_module_name(const char *name) {
+    for (unsigned i = 0; i < 2; ++i) {
+        const char *base = i ? "kernelbase" : "ntdll";
+        size_t n = strlen(base);
+        if (!strncasecmp(name, base, n) && (!name[n] || !strcasecmp(name + n, ".dll")) &&
+            is_lifted_system_dll(i ? "kernelbase.dll" : "ntdll.dll"))
+            return false;
+    }
     const char *modules[] = {"kernel32", "kernelbase", "ntdll"};
     for (size_t i = 0; i < sizeof modules / sizeof *modules; ++i) {
         size_t n = strlen(modules[i]);
@@ -659,6 +686,9 @@ uint64_t guest_module_handle(uint64_t address, uint32_t wide) {
         return service;
     if (is_kernel_module_name(name))
         return KERNEL_MODULE;
+    struct guest_module *module = loaded_module_named(name);
+    if (module)
+        return module->base;
     last_error = 126;
     return 0;
 }
@@ -765,6 +795,34 @@ static const char *resolve_api_set(const char *name, char *buffer, size_t size) 
     return name;
 }
 
+/*
+ * System DLLs that become lifted guest modules when the program supplies them
+ * (LIFTABLE_SYSTEM_DLLS in build_console_modules.py): a precompiled module of
+ * that name, or with on-demand translation, the file beside the program.
+ */
+static bool is_lifted_system_dll(const char *resolved) {
+    static const char *const liftable[] = {"ntdll.dll", "kernelbase.dll"};
+    static _Atomic int cache[2] = {-1, -1};
+    size_t index = 0;
+    while (index < 2 && strcasecmp(resolved, liftable[index]))
+        ++index;
+    if (index == 2)
+        return false;
+    _Atomic int *cached = &cache[index];
+    int state = atomic_load(cached);
+    if (state < 0) {
+        state = 0;
+        for (size_t i = 0; i < guest_module_count; ++i)
+            if (!strcasecmp(guest_modules[i].name, resolved))
+                state = 1;
+        struct stat info;
+        if (!state && getenv("ARM64_RECOMPILER_PYTHON") && !stat(resolved, &info) && S_ISREG(info.st_mode))
+            state = 1;
+        atomic_store(cached, state);
+    }
+    return state;
+}
+
 /* DLLs the runtime implements with named shims (keep in sync with build_console_modules.py). */
 static bool is_system_dll_name(const char *name) {
     static const char *const system[] = {
@@ -774,6 +832,9 @@ static bool is_system_dll_name(const char *name) {
     };
     char buffer[160];
     const char *resolved = resolve_api_set(name, buffer, sizeof buffer);
+    /* Only the DLL's own name selects the lifted copy; API-set contracts stay on the runtime. */
+    if ((resolved == name || resolved == buffer) && is_lifted_system_dll(resolved))
+        return false;
     for (size_t i = 0; i < sizeof system / sizeof *system; ++i)
         if (!strcasecmp(resolved, system[i]))
             return true;
@@ -2471,6 +2532,9 @@ uint64_t guest_nt_write_file(uint64_t handle, uint64_t event, uint64_t apc,
 static uint64_t guest_localeconv(void);
 static uint64_t guest_setlocale(uint64_t category, uint64_t locale_ptr);
 
+/* Set when a named call fell through to guest_unimplemented_stub. */
+static _Thread_local const char *unimplemented_call;
+
 uint64_t guest_unimplemented_stub(const char *func_name, const char *dll_name) {
     if (func_name) {
         if (strcmp(func_name, "setlocale") == 0) return guest_setlocale(0, 0);
@@ -2486,6 +2550,7 @@ uint64_t guest_unimplemented_stub(const char *func_name, const char *dll_name) {
         if (strcmp(func_name, "SuspendThread") == 0) return 0;
         if (strcmp(func_name, "TryEnterCriticalSection") == 0) return 1;
     }
+    unimplemented_call = func_name;
     static const char *logged_functions[1024];
     static size_t logged_count = 0;
     static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -4128,6 +4193,466 @@ uint64_t guest_indirect_call(uint64_t target, uint64_t first, uint64_t second,
     exit(125);
 }
 
+/*
+ * Lifted system DLLs (Wine's ntdll.dll): exports the runtime owns call here by
+ * name. Rtl and Ldr entry points adapt NT conventions (NTSTATUS results,
+ * counted strings, LARGE_INTEGER timeouts) to the runtime's Win32 shims;
+ * everything else, including the Nt* syscalls, dispatches like a named import.
+ */
+enum {
+    STATUS_SUCCESS_NT = 0, STATUS_TIMEOUT_NT = 0x102, STATUS_NO_MORE_ENTRIES_NT = 0x8000001a,
+    STATUS_NOT_IMPLEMENTED_NT = 0xc0000002, STATUS_INVALID_PARAMETER_NT = 0xc000000d,
+    STATUS_NO_MEMORY_NT = 0xc0000017, STATUS_PROCEDURE_NOT_FOUND_NT = 0xc000007a,
+    STATUS_DLL_NOT_FOUND_NT = 0xc0000135, STATUS_ORDINAL_NOT_FOUND_NT = 0xc0000138,
+};
+
+static uint64_t call_system(const char *name, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return guest_indirect_call(system_thunk(name), a, b, c, d);
+}
+
+/* NUL-terminated guest heap copy of a UNICODE_STRING (width 2) or ANSI_STRING (width 1). */
+static uint64_t counted_string_copy(uint64_t string, unsigned width) {
+    if (!string)
+        return 0;
+    uint64_t length = guest_load(string, 2), buffer = guest_load(string + 8, 8);
+    uint64_t copy = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, length + width);
+    for (uint64_t i = 0; copy && i < length; ++i)
+        guest_store(copy + i, guest_load(buffer + i, 1), 1);
+    return copy;
+}
+
+/* NT timeout (NULL: infinite; negative: relative 100 ns; positive: absolute FILETIME) to ms. */
+static uint32_t nt_timeout_ms(uint64_t timeout) {
+    if (!timeout)
+        return UINT32_MAX;
+    int64_t value = (int64_t)guest_load(timeout, 8);
+    if (value > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        int64_t current = ((int64_t)now.tv_sec + 11644473600LL) * 10000000 + now.tv_nsec / 100;
+        value = current - value;
+        if (value > 0)
+            value = 0;
+    }
+    uint64_t ms = (uint64_t)(-value) / 10000;
+    return ms >= UINT32_MAX ? UINT32_MAX - 1 : (uint32_t)ms;
+}
+
+/*
+ * Wine NLS data files (locale.nls, c_*.nls, l_intl.nls, sortdefault.nls,
+ * norm*.nls), loaded once into guest heap memory for kernelbase's locale code.
+ * ARM64_RECOMPILER_NLS_DIR names Wine's share/wine/nls directory.
+ */
+static uint64_t nls_file(const char *name, uint64_t *size) {
+    static struct { char name[32]; uint64_t address, size; } files[16];
+    static size_t count;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < count; ++i)
+        if (!strcmp(files[i].name, name)) {
+            *size = files[i].size;
+            pthread_mutex_unlock(&lock);
+            return files[i].address;
+        }
+    const char *directory = getenv("ARM64_RECOMPILER_NLS_DIR");
+    char path[1024];
+    uint64_t address = 0;
+    struct stat info;
+    int fd = -1;
+    if (directory && count < sizeof files / sizeof *files &&
+        snprintf(path, sizeof path, "%s/%s", directory, name) < (int)sizeof path &&
+        (fd = open(path, O_RDONLY)) >= 0 && !fstat(fd, &info) && info.st_size > 0 &&
+        (address = guest_heap_alloc(GUEST_HEAP_HANDLE, 0, (uint64_t)info.st_size))) {
+        unsigned char *host = (unsigned char *)(uintptr_t)(address & ~UINT64_C(0xFF00000000000000));
+        ssize_t done = 0;
+        while (done < info.st_size) {
+            ssize_t n = read(fd, host + done, (size_t)(info.st_size - done));
+            if (n <= 0)
+                break;
+            done += n;
+        }
+        if (done == info.st_size) {
+            snprintf(files[count].name, sizeof files[count].name, "%s", name);
+            files[count].address = address;
+            files[count].size = *size = (uint64_t)info.st_size;
+            ++count;
+        } else {
+            guest_heap_free(GUEST_HEAP_HANDLE, 0, address);
+            address = 0;
+        }
+    }
+    if (fd >= 0)
+        close(fd);
+    pthread_mutex_unlock(&lock);
+    if (!address && getenv("ARM64_RECOMPILER_TRACE_IMPORTS"))
+        fprintf(stderr, "[nls] cannot load %s (set ARM64_RECOMPILER_NLS_DIR)\n", name);
+    return address;
+}
+
+static uint64_t nt_query_information_process(uint64_t process, uint32_t kind, uint64_t buffer,
+                                             uint32_t length, uint64_t returned) {
+    if (process != UINT64_MAX)
+        return 0xc0000008; /* STATUS_INVALID_HANDLE: only the current process */
+    uint32_t needed;
+    switch (kind) {
+    case 0: /* ProcessBasicInformation */
+        needed = 48;
+        if (length >= needed) {
+            for (uint32_t i = 0; i < needed; i += 8)
+                guest_store(buffer + i, 0, 8);
+            guest_store(buffer + 8, PEB_BASE, 8);
+            guest_store(buffer + 16, 1, 8);
+            guest_store(buffer + 24, 8, 4);
+            guest_store(buffer + 32, guest_identity(0), 8);
+        }
+        break;
+    case 7:    /* ProcessDebugPort */
+    case 0x1a: /* ProcessWow64Information */
+        needed = 8;
+        if (length >= needed)
+            guest_store(buffer, 0, 8);
+        break;
+    case 0x1f: /* ProcessDebugFlags: no debugger */
+        needed = 4;
+        if (length >= needed)
+            guest_store(buffer, 1, 4);
+        break;
+    case 0x24: /* ProcessCookie */
+        needed = 4;
+        if (length >= needed)
+            guest_store(buffer, 0x5eed1234, 4);
+        break;
+    case 0x1e: /* ProcessDebugObjectHandle */
+        return 0xc0000353; /* STATUS_PORT_NOT_SET */
+    default:
+        if (getenv("ARM64_RECOMPILER_TRACE_IMPORTS"))
+            fprintf(stderr, "[override] NtQueryInformationProcess class %#x unsupported\n", kind);
+        return 0xc0000003; /* STATUS_INVALID_INFO_CLASS */
+    }
+    if (returned)
+        guest_store(returned, needed, 4);
+    return length >= needed ? STATUS_SUCCESS_NT : 0xc0000004; /* STATUS_INFO_LENGTH_MISMATCH */
+}
+
+/*
+ * Per-block heap user value and flags (RtlSetUserValueHeap / RtlGetUserInfoHeap),
+ * which Wine's LocalAlloc/GlobalAlloc use to map blocks back to their handles.
+ */
+struct heap_user_info { uint64_t block, value; uint32_t flags; struct heap_user_info *next; };
+static struct heap_user_info *heap_user_buckets[1024];
+static pthread_mutex_t heap_user_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct heap_user_info *heap_user_entry(uint64_t block, bool create) {
+    struct heap_user_info **bucket = &heap_user_buckets[(block >> 4) % 1024];
+    for (struct heap_user_info *entry = *bucket; entry; entry = entry->next)
+        if (entry->block == block)
+            return entry;
+    if (!create)
+        return NULL;
+    struct heap_user_info *entry = calloc(1, sizeof *entry);
+    if (entry) {
+        entry->block = block;
+        entry->next = *bucket;
+        *bucket = entry;
+    }
+    return entry;
+}
+
+static bool rtl_override(const char *name, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t *result) {
+    uint64_t *regs = (uint64_t *)current_cpu;
+    uint64_t stack = regs ? regs[7] + 40 : 0; /* fifth argument */
+    if (!strncmp(name, "Rtl", 3)) {
+        const char *rest = name + 3;
+        static const char *const same[][2] = {
+            {"AllocateHeap", "HeapAlloc"}, {"FreeHeap", "HeapFree"}, {"ReAllocateHeap", "HeapReAlloc"},
+            {"SizeHeap", "HeapSize"}, {"LockHeap", "HeapLock"}, {"UnlockHeap", "HeapUnlock"},
+            {"ValidateHeap", "HeapValidate"}, {"TryEnterCriticalSection", "TryEnterCriticalSection"},
+            {"InitializeSRWLock", "InitializeSRWLock"}, {"AcquireSRWLockExclusive", "AcquireSRWLockExclusive"},
+            {"ReleaseSRWLockExclusive", "ReleaseSRWLockExclusive"}, {"AcquireSRWLockShared", "AcquireSRWLockShared"},
+            {"ReleaseSRWLockShared", "ReleaseSRWLockShared"},
+            {"TryAcquireSRWLockExclusive", "TryAcquireSRWLockExclusive"},
+            {"TryAcquireSRWLockShared", "TryAcquireSRWLockShared"},
+            {"WakeConditionVariable", "WakeConditionVariable"},
+            {"WakeAllConditionVariable", "WakeAllConditionVariable"},
+            {"WakeAddressSingle", "WakeByAddressSingle"}, {"WakeAddressAll", "WakeByAddressAll"},
+            {"GetLastWin32Error", "GetLastError"}, {"SetLastWin32Error", "SetLastError"},
+            {"RestoreLastWin32Error", "SetLastError"}, {"CaptureContext", "RtlCaptureContext"},
+            {"LookupFunctionEntry", "RtlLookupFunctionEntry"}, {"VirtualUnwind", "RtlVirtualUnwind"},
+            {"PcToFileHeader", "RtlPcToFileHeader"}, {"QueryPerformanceCounter", "QueryPerformanceCounter"},
+            {"QueryPerformanceFrequency", "QueryPerformanceFrequency"}, {"GetTickCount", "GetTickCount"},
+        };
+        /* Wine-internal heap flags (HEAP_SETTABLE_USER_*, ...) have no runtime-heap meaning. */
+        if (!strcmp(rest, "AllocateHeap") || !strcmp(rest, "ReAllocateHeap"))
+            b &= GUEST_HEAP_FLAGS;
+        for (size_t i = 0; i < sizeof same / sizeof *same; ++i)
+            if (!strcmp(rest, same[i][0])) {
+                *result = call_system(same[i][1], a, b, c, d);
+                return true;
+            }
+        if (!strcmp(rest, "InitializeConditionVariable")) {
+            guest_store(a, 0, 8);
+            *result = 0;
+        } else if (!strcmp(rest, "CreateHeap")) {
+            *result = call_system("HeapCreate", a, c, d, 0);
+        } else if (!strcmp(rest, "DestroyHeap")) {
+            *result = call_system("HeapDestroy", a, 0, 0, 0) ? 0 : a;
+        } else if (!strcmp(rest, "GetProcessHeaps")) {
+            if (a && b)
+                guest_store(b, GUEST_HEAP_HANDLE, 8);
+            *result = 1;
+        } else if (!strcmp(rest, "SetUserValueHeap") || !strcmp(rest, "SetUserFlagsHeap")) {
+            /* (heap, flags, block, value) / (heap, flags, block, clear, set) */
+            pthread_mutex_lock(&heap_user_lock);
+            struct heap_user_info *entry = heap_user_entry(c, true);
+            if (entry && rest[7] == 'V')
+                entry->value = d;
+            else if (entry)
+                entry->flags = (entry->flags & ~(uint32_t)d) | (stack ? (uint32_t)guest_load(stack, 4) : 0);
+            pthread_mutex_unlock(&heap_user_lock);
+            *result = entry != NULL;
+        } else if (!strcmp(rest, "GetUserInfoHeap")) {
+            /* (heap, flags, block, void **value, ULONG *flags) */
+            pthread_mutex_lock(&heap_user_lock);
+            struct heap_user_info *entry = heap_user_entry(c, false);
+            uint64_t value = entry ? entry->value : 0;
+            uint32_t flags = entry ? entry->flags : 0;
+            pthread_mutex_unlock(&heap_user_lock);
+            if (d)
+                guest_store(d, value, 8);
+            uint64_t flags_out = stack ? guest_load(stack, 8) : 0;
+            if (flags_out)
+                guest_store(flags_out, flags, 4);
+            *result = 1;
+        } else if (!strcmp(rest, "CompactHeap")) {
+            *result = 0;
+        } else if (!strcmp(rest, "SetHeapInformation")) {
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "WalkHeap")) {
+            *result = STATUS_NO_MORE_ENTRIES_NT;
+        } else if (!strcmp(rest, "EnterCriticalSection") || !strcmp(rest, "LeaveCriticalSection") ||
+                   !strcmp(rest, "DeleteCriticalSection")) {
+            guest_critical_section(a, rest[0] == 'D' ? 2 : rest[0] == 'E');
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strncmp(rest, "InitializeCriticalSection", 25)) {
+            guest_init_critical(a, rest[25] ? (uint32_t)b : 0);
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "IsCriticalSectionLocked")) {
+            *result = guest_load(a + 16, 8) != 0;
+        } else if (!strcmp(rest, "IsCriticalSectionLockedByThread")) {
+            *result = guest_load(a + 16, 8) == guest_identity(1);
+        } else if (!strcmp(rest, "SleepConditionVariableSRW") || !strcmp(rest, "SleepConditionVariableCS")) {
+            uint32_t ms = nt_timeout_ms(c);
+            uint64_t ok = rest[22] == 'S'
+                ? call_system("SleepConditionVariableSRW", a, b, ms, d)
+                : call_system("SleepConditionVariableCS", a, b, ms, 0);
+            *result = ok ? STATUS_SUCCESS_NT : STATUS_TIMEOUT_NT;
+        } else if (!strcmp(rest, "WaitOnAddress")) {
+            *result = call_system("WaitOnAddress", a, b, c, nt_timeout_ms(d)) ? STATUS_SUCCESS_NT : STATUS_TIMEOUT_NT;
+        } else if (!strcmp(rest, "FlsAlloc")) {
+            uint64_t index = guest_indirect_call(FLS_ALLOC, a, 0, 0, 0);
+            if ((uint32_t)index == UINT32_MAX) {
+                *result = STATUS_NO_MEMORY_NT;
+            } else {
+                guest_store(b, index, 4);
+                *result = STATUS_SUCCESS_NT;
+            }
+        } else if (!strcmp(rest, "FlsFree")) {
+            *result = guest_indirect_call(FLS_FREE, a, 0, 0, 0) ? STATUS_SUCCESS_NT : STATUS_INVALID_PARAMETER_NT;
+        } else if (!strcmp(rest, "FlsGetValue")) {
+            uint64_t value = guest_indirect_call(FLS_GET, a, 0, 0, 0);
+            if (last_error) {
+                *result = STATUS_INVALID_PARAMETER_NT;
+            } else {
+                guest_store(b, value, 8);
+                *result = STATUS_SUCCESS_NT;
+            }
+        } else if (!strcmp(rest, "FlsSetValue")) {
+            *result = guest_indirect_call(FLS_SET, a, b, 0, 0) ? STATUS_SUCCESS_NT : STATUS_INVALID_PARAMETER_NT;
+        } else if (!strcmp(rest, "RaiseException")) {
+            if (!regs)
+                guest_trap("RtlRaiseException requires a guest context");
+            uint64_t rsp = regs[7];
+            guest_raise_exception((uint32_t)guest_load(a, 4), (uint32_t)guest_load(a + 4, 4),
+                                  (uint32_t)guest_load(a + 24, 4), a + 32, guest_load(rsp, 8), rsp + 8);
+            *result = 0;
+        } else if (!strcmp(rest, "AddVectoredExceptionHandler")) {
+            *result = guest_add_vectored_exception_handler((uint32_t)a, b);
+        } else if (!strcmp(rest, "RemoveVectoredExceptionHandler")) {
+            *result = guest_remove_vectored_exception_handler(a);
+        } else if (!strcmp(rest, "ExitUserProcess")) {
+            guest_exit((uint32_t)a);
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (!strncmp(name, "Nt", 2)) {
+        const char *rest = name + 2;
+        if (!strcmp(rest, "Close")) {
+            *result = guest_close_handle(a) ? STATUS_SUCCESS_NT : 0xc0000008; /* STATUS_INVALID_HANDLE */
+        } else if (!strcmp(rest, "QueryPerformanceCounter")) {
+            guest_performance_counter(a);
+            if (b)
+                guest_performance_frequency(b);
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "QuerySystemTime")) {
+            guest_system_filetime(a);
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "YieldExecution")) {
+            sched_yield();
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "DelayExecution")) {
+            uint32_t ms = nt_timeout_ms(b);
+            if (ms == UINT32_MAX)
+                for (;;)
+                    pause();
+            if (ms)
+                usleep(ms * 1000);
+            else
+                sched_yield();
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "QueryInformationProcess")) {
+            *result = nt_query_information_process(a, (uint32_t)b, c, (uint32_t)d,
+                                                   stack ? guest_load(stack, 8) : 0);
+        } else if (!strcmp(rest, "InitializeNlsFiles")) {
+            /* (void **ptr, LCID *lcid, LARGE_INTEGER *size): locale.nls, en-US */
+            uint64_t size = 0, address = nls_file("locale.nls", &size);
+            if (!address) {
+                *result = 0xc0000034; /* STATUS_OBJECT_NAME_NOT_FOUND */
+            } else {
+                guest_store(a, address, 8);
+                if (b)
+                    guest_store(b, 0x409, 4);
+                if (c)
+                    guest_store(c, size, 8);
+                *result = STATUS_SUCCESS_NT;
+            }
+        } else if (!strcmp(rest, "GetNlsSectionPtr")) {
+            /* (type, id, unknown, void **ptr, SIZE_T *size) */
+            char file[32] = "";
+            uint32_t type = (uint32_t)a, id = (uint32_t)b;
+            static const char *const normalize[16] = {
+                [1] = "normnfc.nls", [2] = "normnfd.nls", [5] = "normnfkc.nls",
+                [6] = "normnfkd.nls", [13] = "normidna.nls",
+            };
+            if (type == 9)
+                snprintf(file, sizeof file, "sortdefault.nls");
+            else if (type == 10)
+                snprintf(file, sizeof file, "%s", id ? "" : "l_intl.nls");
+            else if (type == 11)
+                snprintf(file, sizeof file, "c_%03u.nls", id);
+            else if (type == 12 && id < 16 && normalize[id])
+                snprintf(file, sizeof file, "%s", normalize[id]);
+            uint64_t size = 0, address = file[0] ? nls_file(file, &size) : 0;
+            if (!address) {
+                *result = 0xc0000034;
+            } else {
+                guest_store(d, address, 8);
+                uint64_t size_out = stack ? guest_load(stack, 8) : 0;
+                if (size_out)
+                    guest_store(size_out, size, 8);
+                *result = STATUS_SUCCESS_NT;
+            }
+        } else if (!strcmp(rest, "QueryDefaultLocale")) {
+            /* (user, LCID *): en-US */
+            guest_store(b, 0x409, 4);
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "QueryDefaultUILanguage") || !strcmp(rest, "QueryInstallUILanguage")) {
+            guest_store(a, 0x409, 2);
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "GetCurrentProcessorNumber")) {
+            *result = 0;
+        } else if (!strcmp(rest, "AllocateVirtualMemory")) {
+            /* (process, PVOID *base, zero_bits, SIZE_T *size, type, protect) */
+            uint64_t base = guest_load(b, 8), size = guest_load(d, 8);
+            uint32_t type = stack ? (uint32_t)guest_load(stack, 4) : 0x1000;
+            uint32_t protect = stack ? (uint32_t)guest_load(stack + 8, 4) : 4;
+            uint64_t address = subsys_VirtualAlloc(base, size, type, protect);
+            if (address) {
+                guest_store(b, address, 8);
+                guest_store(d, (size + 0xfff) & ~UINT64_C(0xfff), 8);
+            }
+            *result = address ? STATUS_SUCCESS_NT : STATUS_NO_MEMORY_NT;
+        } else if (!strcmp(rest, "FreeVirtualMemory")) {
+            /* (process, PVOID *base, SIZE_T *size, type) */
+            *result = subsys_VirtualFree(guest_load(b, 8), guest_load(c, 8), (uint32_t)d)
+                      ? STATUS_SUCCESS_NT : STATUS_INVALID_PARAMETER_NT;
+        } else if (!strcmp(rest, "ProtectVirtualMemory")) {
+            /* (process, PVOID *base, SIZE_T *size, new, ULONG *old) */
+            uint64_t old = stack ? guest_load(stack, 8) : 0;
+            *result = guest_virtual_protect(guest_load(b, 8), guest_load(c, 8), (uint32_t)d, old)
+                      ? STATUS_SUCCESS_NT : STATUS_INVALID_PARAMETER_NT;
+        } else if (!strcmp(rest, "TerminateProcess")) {
+            if (!a || a == UINT64_MAX)
+                guest_exit((uint32_t)b);
+            *result = guest_terminate_process(a, (uint32_t)b) ? STATUS_SUCCESS_NT : 0xc0000008;
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (!strncmp(name, "Ldr", 3)) {
+        const char *rest = name + 3;
+        if (!strcmp(rest, "LoadDll") || !strcmp(rest, "GetDllHandle") || !strcmp(rest, "GetDllHandleEx")) {
+            bool ex = rest[0] == 'G' && rest[12];
+            uint64_t string = ex ? d : c, out = ex ? (stack ? guest_load(stack, 8) : 0) : d;
+            uint64_t copy = counted_string_copy(string, 2);
+            uint64_t handle = !copy ? 0 : rest[0] == 'L' ? guest_load_library(copy, 0, 0)
+                                                         : guest_module_handle(copy, 1);
+            if (copy)
+                guest_heap_free(GUEST_HEAP_HANDLE, 0, copy);
+            if (out)
+                guest_store(out, handle, 8);
+            *result = handle ? STATUS_SUCCESS_NT : STATUS_DLL_NOT_FOUND_NT;
+        } else if (!strcmp(rest, "GetProcedureAddress")) {
+            uint64_t copy = counted_string_copy(b, 1);
+            uint64_t address = guest_get_proc(a, copy ? copy : (c & 0xffff));
+            if (copy)
+                guest_heap_free(GUEST_HEAP_HANDLE, 0, copy);
+            if (d)
+                guest_store(d, address, 8);
+            *result = address ? STATUS_SUCCESS_NT : b ? STATUS_PROCEDURE_NOT_FOUND_NT : STATUS_ORDINAL_NOT_FOUND_NT;
+        } else if (!strcmp(rest, "UnloadDll")) {
+            *result = guest_free_library(a) ? STATUS_SUCCESS_NT : STATUS_DLL_NOT_FOUND_NT;
+        } else if (!strcmp(rest, "AddRefDll") || !strcmp(rest, "UnlockLoaderLock")) {
+            *result = STATUS_SUCCESS_NT;
+        } else if (!strcmp(rest, "LockLoaderLock")) {
+            if (b)
+                guest_store(b, 1, 4); /* LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED */
+            if (c)
+                guest_store(c, 1, 8);
+            *result = STATUS_SUCCESS_NT;
+        } else {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+uint64_t guest_named_call(uint64_t *cache, const char *name, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("ARM64_RECOMPILER_TRACE_IMPORTS") != NULL;
+    if (trace)
+        fprintf(stderr, "[override] %s(%#llx, %#llx, %#llx, %#llx)\n", name, (unsigned long long)a,
+                (unsigned long long)b, (unsigned long long)c, (unsigned long long)d);
+    uint64_t result;
+    if (rtl_override(name, a, b, c, d, &result))
+        return result;
+    uint64_t token = atomic_load_explicit((_Atomic uint64_t *)cache, memory_order_relaxed);
+    if (!token) {
+        token = system_thunk(name);
+        atomic_store_explicit((_Atomic uint64_t *)cache, token, memory_order_relaxed);
+    }
+    unimplemented_call = NULL;
+    result = guest_indirect_call(token, a, b, c, d);
+    /* NT entry points report failure through NTSTATUS, not a zero return. */
+    if (unimplemented_call && (!strncmp(name, "Nt", 2) || !strncmp(name, "Zw", 2) || !strncmp(name, "Ldr", 3)))
+        return STATUS_NOT_IMPLEMENTED_NT;
+    return result;
+}
+
 void guest_check_return(uint64_t addr, uint64_t expected);
 
 __attribute__((weak)) const struct guest_dispatch_entry guest_dispatch_table[] = {{0, NULL}};
@@ -5157,6 +5682,87 @@ uint64_t guest_command_line(uint32_t wide) {
     return command_lines[wide] = pointer;
 }
 
+/* Fill a UNICODE_STRING at field with a guest heap copy of an ASCII host string. */
+static void put_unicode_string(uint64_t field, const char *text, size_t extra) {
+    size_t length = strlen(text);
+    uint64_t buffer = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, (length + 1 + extra) * 2);
+    for (size_t i = 0; buffer && i < length; ++i)
+        guest_store(buffer + i * 2, (unsigned char)text[i], 2);
+    guest_store(field, buffer ? length * 2 : 0, 2);
+    guest_store(field + 2, buffer ? (length + 1 + extra) * 2 : 0, 2);
+    guest_store(field + 8, buffer, 8);
+}
+
+/*
+ * PEB->ProcessParameters (RTL_USER_PROCESS_PARAMETERS, normalized): Wine's
+ * kernelbase reads the environment, command line, current directory and
+ * standard handles from it rather than calling into the loader.
+ */
+static void init_process_parameters(void) {
+    enum { SIZE = 0x410 };
+    uint64_t params = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, SIZE);
+    if (!params)
+        return;
+    guest_store(params + 0x00, SIZE, 4);           /* MaximumLength */
+    guest_store(params + 0x04, SIZE, 4);           /* Length */
+    guest_store(params + 0x08, 1, 4);              /* PROCESS_PARAMS_FLAG_NORMALIZED */
+    guest_store(params + 0x20, guest_stdout((uint32_t)-10), 8);
+    guest_store(params + 0x28, guest_stdout((uint32_t)-11), 8);
+    guest_store(params + 0x30, guest_stdout((uint32_t)-12), 8);
+    char directory[1024] = "C:\\";
+    char host[1024];
+    if (getcwd(host, sizeof host)) {
+        snprintf(directory, sizeof directory, "Z:%s\\", host);
+        for (char *c = directory; *c; ++c)
+            if (*c == '/')
+                *c = '\\';
+    }
+    put_unicode_string(params + 0x38, directory, 260);   /* CurrentDirectory.DosPath */
+    put_unicode_string(params + 0x50, "C:\\Windows\\System32;C:\\Windows", 0); /* DllPath */
+    char image_path[1024];
+    snprintf(image_path, sizeof image_path, "%s%s", directory,
+             host_argc > 0 && host_argv[0] ? (strrchr(host_argv[0], '/') ? strrchr(host_argv[0], '/') + 1 : host_argv[0])
+                                           : "app.exe");
+    put_unicode_string(params + 0x60, image_path, 0);     /* ImagePathName */
+    /* CommandLine (wide). guest_command_line stops on non-ASCII arguments, so
+       only build it eagerly when every argument is ASCII. */
+    bool ascii = true;
+    for (int i = 1; i < host_argc && ascii; ++i)
+        for (const unsigned char *c = (const unsigned char *)host_argv[i]; *c && ascii; ++c)
+            ascii = *c < 0x80;
+    uint64_t line = ascii ? guest_command_line(1) : 0;
+    uint64_t length = 0;
+    while (line && guest_load(line + length * 2, 2))
+        ++length;
+    guest_store(params + 0x70, length * 2, 2);
+    guest_store(params + 0x72, (length + 1) * 2, 2);
+    guest_store(params + 0x78, line, 8);
+    uint64_t environment = guest_environment();
+    uint64_t units = 0;
+    while (environment && (guest_load(environment + units * 2, 2) || guest_load(environment + units * 2 + 2, 2)))
+        ++units;
+    guest_store(params + 0x80, environment, 8);           /* Environment */
+    put_unicode_string(params + 0xb0, image_path, 0);     /* WindowTitle */
+    put_unicode_string(params + 0xc0, "", 0);             /* Desktop */
+    put_unicode_string(params + 0xd0, "", 0);             /* ShellInfo */
+    guest_store(params + 0x3f0, environment ? (units + 2) * 2 : 0, 8); /* EnvironmentSize */
+    put64(peb, 0x20, params);
+    /* FastPebLock: RtlAcquirePebLock enters it around ProcessParameters updates. */
+    uint64_t lock = guest_heap_alloc(GUEST_HEAP_HANDLE, 8, 40);
+    if (lock) {
+        guest_init_critical(lock, 0);
+        put64(peb, 0x38, lock);
+    }
+    long processors = sysconf(_SC_NPROCESSORS_ONLN);
+    uint32_t fields[][2] = {
+        {0xb8, processors > 0 ? (uint32_t)processors : 1}, /* NumberOfProcessors */
+        {0x118, 10}, {0x11c, 0}, {0x120, 19045}, {0x124, 2}, /* OS version: Windows 10 22H2 */
+        {0x128, 3}, {0x12c, 6}, {0x130, 0},                  /* console subsystem 6.0 */
+    };
+    for (size_t i = 0; i < sizeof fields / sizeof *fields; ++i)
+        memcpy(peb + fields[i][0], &fields[i][1], 4);
+}
+
 int main(int argc, char **argv) {
     const char *watch = getenv("GUEST_WATCH_RVA");
     if (watch && *watch) {
@@ -5170,6 +5776,7 @@ int main(int argc, char **argv) {
     init_runtime_data();
     put64(peb, 0x10, guest_image_base);
     put64(peb, 0x30, 0x7fff2001); /* ProcessHeap, read directly by Wine's CRT */
+    init_process_parameters();
     image = calloc(guest_section_count ? guest_section_count : 1, sizeof *image);
     section_protection = calloc(guest_section_count ? guest_section_count : 1, sizeof *section_protection);
     image_page_prot = calloc(guest_section_count ? guest_section_count : 1, sizeof *image_page_prot);

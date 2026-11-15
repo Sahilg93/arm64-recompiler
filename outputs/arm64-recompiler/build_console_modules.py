@@ -35,8 +35,80 @@ def resolve_api_set(name):
     return lower
 
 
-def is_system_dll(name):
+# System DLLs that become lifted guest modules when the program supplies them
+# (shipped beside it, or passed explicitly). The runtime still implements their
+# syscalls and process-global state (see system_overrides).
+LIFTABLE_SYSTEM_DLLS = {"ntdll.dll", "kernelbase.dll"}
+
+# ntdll exports the runtime implements: they own process-global state (heaps,
+# last error, locks, TLS/FLS, loader, exceptions) that must stay shared with the
+# runtime's kernel32 shims. Wine's pure-PE Rtl code covers everything else.
+NTDLL_RUNTIME_EXPORTS = {
+    "RtlAllocateHeap", "RtlFreeHeap", "RtlReAllocateHeap", "RtlSizeHeap", "RtlCreateHeap",
+    "RtlDestroyHeap", "RtlLockHeap", "RtlUnlockHeap", "RtlValidateHeap", "RtlCompactHeap",
+    "RtlGetProcessHeaps", "RtlSetHeapInformation", "RtlQueryHeapInformation", "RtlWalkHeap",
+    "RtlSetUserValueHeap", "RtlGetUserInfoHeap", "RtlSetUserFlagsHeap",
+    "RtlInitializeCriticalSection", "RtlInitializeCriticalSectionAndSpinCount",
+    "RtlInitializeCriticalSectionEx", "RtlEnterCriticalSection", "RtlLeaveCriticalSection",
+    "RtlTryEnterCriticalSection", "RtlDeleteCriticalSection", "RtlIsCriticalSectionLocked",
+    "RtlIsCriticalSectionLockedByThread",
+    "RtlInitializeSRWLock", "RtlAcquireSRWLockExclusive", "RtlReleaseSRWLockExclusive",
+    "RtlAcquireSRWLockShared", "RtlReleaseSRWLockShared", "RtlTryAcquireSRWLockExclusive",
+    "RtlTryAcquireSRWLockShared", "RtlInitializeConditionVariable", "RtlWakeConditionVariable",
+    "RtlWakeAllConditionVariable", "RtlSleepConditionVariableSRW", "RtlSleepConditionVariableCS",
+    "RtlWaitOnAddress", "RtlWakeAddressSingle", "RtlWakeAddressAll",
+    "RtlGetLastWin32Error", "RtlSetLastWin32Error", "RtlRestoreLastWin32Error",
+    "RtlSetLastWin32ErrorAndNtStatusFromNtStatus",
+    "RtlFlsAlloc", "RtlFlsFree", "RtlFlsGetValue", "RtlFlsSetValue",
+    "RtlRaiseException", "RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind",
+    "RtlPcToFileHeader", "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
+    "RtlUnwind", "RtlUnwindEx", "RtlRestoreContext",
+    "RtlQueryPerformanceCounter", "RtlQueryPerformanceFrequency", "RtlGetTickCount",
+    "RtlExitUserProcess", "RtlExitUserThread",
+    "LdrLoadDll", "LdrGetDllHandle", "LdrGetDllHandleEx", "LdrGetProcedureAddress", "LdrUnloadDll",
+    "LdrAddRefDll", "LdrLockLoaderLock", "LdrUnlockLoaderLock", "LdrFindEntryForAddress",
+    "LdrGetDllFullName", "LdrGetDllPath", "LdrResolveDelayLoadedAPI", "LdrShutdownProcess",
+    "LdrShutdownThread", "LdrInitializeThunk", "LdrRegisterDllNotification",
+    "LdrUnregisterDllNotification", "LdrQueryProcessModuleInformation",
+    "LdrAccessResource", "LdrFindResource_U", "LdrFindResourceDirectory_U",
+    # Debug channels: the runtime drops messages unless ARM64_RECOMPILER_WINE_DEBUG is set.
+    "__wine_dbg_get_channel_flags", "__wine_dbg_header", "__wine_dbg_strdup", "__wine_dbg_output",
+}
+
+
+def syscall_number(image, rva):
+    """The service number of a Wine/Windows syscall stub (mov r10, rcx; mov eax, N), else None."""
+    head = image.get_data(rva, 8)
+    if len(head) == 8 and head[:4] == b"\x4c\x8b\xd1\xb8":
+        return int.from_bytes(head[4:8], "little")
+    return None
+
+
+def system_overrides(name, image):
+    """RVA -> runtime function name (None: return TRUE) for a liftable system DLL."""
+    if name.lower() != "ntdll.dll":
+        return {}
+    overrides = {}
+    exports = getattr(image, "DIRECTORY_ENTRY_EXPORT", None)
+    for symbol in exports.symbols if exports else ():
+        if not symbol.name or symbol.forwarder:
+            continue
+        label = symbol.name.decode("ascii")
+        if syscall_number(image, symbol.address) is not None:
+            # Zw* aliases share the Nt* stub; name the override after Nt*.
+            overrides[symbol.address] = "Nt" + label[2:] if label.startswith("Zw") else label
+        elif label in NTDLL_RUNTIME_EXPORTS:
+            overrides[symbol.address] = label
+    # The runtime loader owns loader state; Wine's DllMain would walk its own lists.
+    overrides[image.OPTIONAL_HEADER.AddressOfEntryPoint] = None
+    return overrides
+
+
+def is_system_dll(name, available=()):
     resolved = resolve_api_set(name)
+    # Only the DLL's own name selects the lifted copy; API-set contracts stay on the runtime.
+    if resolved in LIFTABLE_SYSTEM_DLLS and resolved in available:
+        return False
     return resolved in SYSTEM_DLLS or resolved.startswith(SYSTEM_API_SET_PREFIXES)
 
 
@@ -49,12 +121,12 @@ def bound_import_dlls(image, available):
     bound = set()
     for dll in getattr(image, "DIRECTORY_ENTRY_IMPORT", ()):
         name = dll.dll.decode("ascii")
-        if not is_system_dll(name) and resolve_api_set(name) in available:
+        if not is_system_dll(name, available) and resolve_api_set(name) in available:
             bound.add(name.lower())
     return bound
 
 
-def lift_module(path, image, index, work, registry, load_base, trace=False):
+def lift_module(path, image, index, work, registry, load_base, trace=False, available=None):
     name = path.name
     if not name.isascii() or len(name) > 128 or not name.lower().endswith(".dll"):
         raise ValueError(f"unsupported DLL filename {name!r}")
@@ -64,6 +136,10 @@ def lift_module(path, image, index, work, registry, load_base, trace=False):
     if any(hasattr(image, directory) for directory in
            ("DIRECTORY_ENTRY_TLS", "DIRECTORY_ENTRY_DELAY_IMPORT")):
         raise ValueError(f"{path}: DLL uses unsupported loader metadata")
+    if available is None:
+        # On-demand translation: the DLLs beside this one are the program's.
+        folder = Path(path).resolve().parent
+        available = {item.name.lower() for item in folder.iterdir() if item.suffix.lower() == ".dll"}
     imports = []
     bound = set()
     image_base = image.OPTIONAL_HEADER.ImageBase
@@ -71,7 +147,7 @@ def lift_module(path, image, index, work, registry, load_base, trace=False):
         dependency = dll.dll.decode("ascii")
         if any(c in dependency for c in "/\\:"):
             raise ValueError(f"{path}: unsupported dependency name {dependency!r}")
-        if is_system_dll(dependency):
+        if is_system_dll(dependency, available):
             # Calls go to the runtime's named shims; the runtime still fills these
             # slots with named tokens so code that loads a slot can call it.
             target = dependency.lower()
@@ -85,7 +161,8 @@ def lift_module(path, image, index, work, registry, load_base, trace=False):
     tag = f"module_{index}"
     entry, base, code, data = read_console_image(image, load_base=load_base)
     # Real system DLLs contain code the lifter cannot translate yet; trap there only if it runs.
-    lifter = ConsoleLift(image, stub_unknown=False, tolerant=True, bound_dlls=bound, trace=trace)
+    lifter = ConsoleLift(image, stub_unknown=False, tolerant=True, bound_dlls=bound, trace=trace,
+                         overrides=system_overrides(name, image))
     lifter.image_base = load_base
     ir = lifter.emit_console(entry, base, code, data, module=tag)
     llvm = work / f"{tag}.ll"
@@ -283,7 +360,7 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
             base, end = module_range(path, image, ranges)
             if path.name.lower() in names:
                 raise ValueError(f"{path}: duplicate DLL filename")
-            llvm, row = lift_module(path, image, index, work, registry, base)
+            llvm, row = lift_module(path, image, index, work, registry, base, available=available)
             names.add(path.name.lower())
             ranges.append((base, end))
             modules.append(llvm)
