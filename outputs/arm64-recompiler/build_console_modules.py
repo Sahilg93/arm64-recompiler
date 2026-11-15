@@ -2,6 +2,7 @@
 """Build an ARM64 console runner with precompiled x64 Windows DLLs."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -131,6 +132,28 @@ def lift_module(path, image, index, work, registry, load_base, trace=False):
     return llvm, row
 
 
+def compile_parallel(sources, work, flags=("-O2",)):
+    """Compile independent C / LLVM IR translation units to objects on all cores.
+
+    Lifted modules are large single translation units; clang given several
+    inputs compiles them one after another. Objects come back in input order;
+    existing objects (*.o) pass through unchanged.
+    """
+    root = Path(__file__).resolve().parent
+    def one(item):
+        index, source = item
+        source = Path(source)
+        if source.suffix == ".o":
+            return source
+        target = Path(work) / f"unit{index}-{source.stem}.o"
+        include = ["-I", str(root)] if source.suffix == ".c" else []
+        subprocess.run(["clang", "-arch", "arm64", *flags, "-Wno-override-module", *include,
+                        "-c", str(source), "-o", str(target)], check=True)
+        return target
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        return list(pool.map(one, enumerate(sources)))
+
+
 def module_range(path, image, ranges):
     preferred = image.OPTIONAL_HEADER.ImageBase
     size = image.OPTIONAL_HEADER.SizeOfImage
@@ -183,9 +206,9 @@ def build_plugin(path, output_path, ranges):
         source = work / "registry.c"
         source.write_text("\n".join((*registry, f"struct guest_module translated_guest_module = {row};", "")))
         output = work / "plugin.dylib"
-        subprocess.run(["clang", "-arch", "arm64", "-O2", "-dynamiclib",
-                        "-undefined", "dynamic_lookup", "-Wno-override-module",
-                        "-I", str(root), str(source), str(llvm), "-o", str(output)], check=True)
+        objects = compile_parallel([source, llvm], work)
+        subprocess.run(["clang", "-arch", "arm64", "-dynamiclib", "-undefined", "dynamic_lookup",
+                        *map(str, objects), "-o", str(output)], check=True)
         if cached:
             import shutil
             shutil.copyfile(output, cached)
@@ -278,17 +301,22 @@ def build(exe_path, output_path, dll_paths, *, lazy_modules=False, trace=False):
             modules.append(source)
         output = work / "runner"
         primary_object = work / "main.o"
-        subprocess.run(["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
-                        "-c", str(primary), "-o", str(primary_object)], check=True)
+        # The primary module stays at -O0; the runtime, lifted DLLs, and
+        # registry build at -O2. All compile concurrently.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            primary_job = pool.submit(subprocess.run, ["clang", "-arch", "arm64", "-O0", "-Wno-override-module",
+                                      "-c", str(primary), "-o", str(primary_object)], check=True)
+            others = pool.submit(compile_parallel, [root / "console_runtime.c", *modules[1:]], work)
+            primary_job.result()
+            objects = others.result()
         modules[0] = primary_object
         if not no_cache:
             import shutil
             shutil.copyfile(primary_object, cached_o)
             if source and source.exists():
                 shutil.copyfile(source, cached_reg)
-        subprocess.run(["clang", "-arch", "arm64", "-O2", "-Wno-override-module",
-                        "-I", str(root), str(root / "console_runtime.c"),
-                        *map(str, modules), "-o", str(output)], check=True)
+        subprocess.run(["clang", "-arch", "arm64", str(primary_object), *map(str, objects),
+                        "-o", str(output)], check=True)
         output.replace(output_path)
 
 
