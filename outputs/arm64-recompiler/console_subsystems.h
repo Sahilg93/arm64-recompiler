@@ -918,26 +918,59 @@ bool subsys_vm_tracked(uint64_t addr) {
 }
 
 /*
- * The runtime reads any address in [image base, image base + 512 MiB) as an
- * image address, so host mappings handed to the guest must stay outside it.
+ * Host mappings handed to the guest must stay out of every reserved guest
+ * image range (guest_reserved_overlap). A guest base hint inside one fails;
+ * without a hint, a mapping that lands inside one is moved past it.
  */
-static bool subsys_in_image_window(uintptr_t address, size_t size) {
-    uint64_t low = guest_image_base, high = guest_image_base + 0x20000000;
-    return guest_image_base && address < high && address + size > low;
-}
-
 static void *subsys_guest_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
-    void *ptr = mmap(hint, size, prot, flags, fd, offset);
-    if (ptr == MAP_FAILED || hint || !subsys_in_image_window((uintptr_t)ptr, size))
-        return ptr;
-    munmap(ptr, size);
-    ptr = mmap((void *)(uintptr_t)(guest_image_base + 0x20000000), size, prot, flags, fd, offset);
-    if (ptr != MAP_FAILED && subsys_in_image_window((uintptr_t)ptr, size)) {
+    if (hint) {
+        if (guest_reserved_overlap((uintptr_t)hint, size)) {
+            errno = EEXIST;
+            return MAP_FAILED;
+        }
+        return mmap(hint, size, prot, flags, fd, offset);
+    }
+    void *ptr = mmap(NULL, size, prot, flags, fd, offset);
+    for (int attempt = 0; ptr != MAP_FAILED; ++attempt) {
+        uint64_t past = guest_reserved_overlap((uintptr_t)ptr, size);
+        if (!past)
+            return ptr;
         munmap(ptr, size);
-        errno = ENOMEM;
-        return MAP_FAILED;
+        if (attempt == 32 || past == UINT64_MAX) {
+            errno = ENOMEM;
+            return MAP_FAILED;
+        }
+        ptr = mmap((void *)(uintptr_t)past, size, prot, flags, fd, offset);
     }
     return ptr;
+}
+
+/* Append ",low:high" for each live VirtualAlloc region and mapped view; frees ranges on failure. */
+static char *subsys_append_mapping_ranges(char *ranges) {
+    pthread_mutex_lock(&g_vm_lock);
+    for (size_t i = 0; ranges && i < g_vm_region_count; ++i) {
+        char *next = NULL;
+        if (asprintf(&next, "%s,%llu:%llu", ranges, (unsigned long long)g_vm_regions[i].base,
+                     (unsigned long long)(g_vm_regions[i].base + g_vm_regions[i].size)) < 0)
+            next = NULL;
+        free(ranges);
+        ranges = next;
+    }
+    pthread_mutex_unlock(&g_vm_lock);
+    pthread_mutex_lock(&g_handle_lock);
+    for (size_t i = 0; ranges && i < MAX_HANDLES; ++i) {
+        if (g_handles[i].kind != HANDLE_KIND_MAPPING || !g_handles[i].map_ptr)
+            continue;
+        char *next = NULL;
+        uintptr_t base = (uintptr_t)g_handles[i].map_ptr;
+        if (asprintf(&next, "%s,%llu:%llu", ranges, (unsigned long long)base,
+                     (unsigned long long)(base + g_handles[i].map_size)) < 0)
+            next = NULL;
+        free(ranges);
+        ranges = next;
+    }
+    pthread_mutex_unlock(&g_handle_lock);
+    return ranges;
 }
 
 unsigned char *subsys_mapping_span(uint64_t addr, uint64_t size) {
@@ -1002,7 +1035,7 @@ uint64_t subsys_VirtualAlloc(uint64_t lpAddress, uint64_t dwSize, uint32_t flAll
                                   MAP_ANON | MAP_PRIVATE, -1, 0);
     if (ptr == MAP_FAILED) {
         pthread_mutex_unlock(&g_vm_lock);
-        guest_set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+        guest_set_last_error(lpAddress ? 487 : 8); // ERROR_INVALID_ADDRESS / NOT_ENOUGH_MEMORY
         return 0;
     }
     if (lpAddress && (uintptr_t)ptr != start) {
@@ -1146,8 +1179,8 @@ uint64_t subsys_MapViewOfFileEx(uint64_t hFileMappingObject, uint32_t dwDesiredA
     }
 
     int flags = (dwDesiredAccess == 1 ? MAP_PRIVATE : MAP_SHARED); // FILE_MAP_COPY
+    /* Never MAP_FIXED: a guest base hint must not replace host mappings. */
     void *hint = lpBaseAddress ? (void *)(uintptr_t)lpBaseAddress : NULL;
-    if (hint) flags |= MAP_FIXED;
 
     void *ptr;
     if (e->fd >= 0) {
@@ -1157,7 +1190,15 @@ uint64_t subsys_MapViewOfFileEx(uint64_t hFileMappingObject, uint32_t dwDesiredA
     }
 
     if (ptr == MAP_FAILED) {
-        set_win32_errno(errno);
+        if (hint)
+            guest_set_last_error(487); // ERROR_INVALID_ADDRESS
+        else
+            set_win32_errno(errno);
+        return 0;
+    }
+    if (hint && ptr != hint) {
+        munmap(ptr, sz);
+        guest_set_last_error(487);
         return 0;
     }
 

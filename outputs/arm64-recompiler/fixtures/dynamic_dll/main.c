@@ -36,6 +36,16 @@ void entry(void) {
     if (!module)
         ExitProcess(10);
 
+    /* The loaded DLL image is reserved guest address space: an explicit
+       VirtualAlloc inside it fails, and anonymous allocations stay outside. */
+    if (VirtualAlloc((char *)module + 0x1000, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) ||
+            GetLastError() != ERROR_INVALID_ADDRESS)
+        ExitProcess(16);
+    char *block = VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!block || (block < (char *)module + 0x1000 && block + 0x10000 > (char *)module) ||
+            !VirtualFree(block, 0, MEM_RELEASE))
+        ExitProcess(17);
+
 #ifdef RUN_ON_MAIN_THREAD
     DWORD status = worker(module);
     if (status)

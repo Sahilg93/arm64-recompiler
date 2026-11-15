@@ -198,9 +198,77 @@ static bool fits(uint64_t addr, uint64_t size, uint64_t start, uint64_t length) 
 
 static _Thread_local uint64_t guest_pc, guest_fault_pc;
 static _Thread_local bool delivering_fault;
+
+/*
+ * Image-section fast path. Loads and stores into the primary image's own
+ * sections (.data/.rdata globals, jump tables) are the hottest non-stack,
+ * non-heap guest accesses. While every host page of a section is readable
+ * (writable), a load (store) that fits the section cannot fault and needs no
+ * armed signal state. Bit i of image_read_fast / image_write_fast says
+ * section i qualifies; guest_virtual_protect recomputes the bits from the
+ * per-page host protection in image_page_prot, so a temporary VirtualProtect
+ * (MinGW's pseudo-relocator) only diverts the section to the faultable slow
+ * path until its pages are restored. Anything the fast path declines
+ * (straddling, unmapped, protected) takes the slow path unchanged.
+ */
+static _Atomic uint64_t image_read_fast, image_write_fast;
+/* image_page_section[rva >> 12] is 1 + the section owning that 4 KiB page, or 0. */
+static uint8_t *image_page_section;
+static uint64_t image_page_limit;
+static int **image_page_prot;
+static size_t *image_page_count;
+
+/* Recompute section i's fast-path bits from its host page protections. */
+static void image_update_fast(uint64_t i, bool writable_section) {
+    if (i >= 64)
+        return;
+    int all = PROT_READ | PROT_WRITE;
+    for (size_t page = 0; page < image_page_count[i]; ++page)
+        all &= image_page_prot[i][page];
+    uint64_t bit = UINT64_C(1) << i;
+    if (all & PROT_READ)
+        atomic_fetch_or(&image_read_fast, bit);
+    else
+        atomic_fetch_and(&image_read_fast, ~bit);
+    if ((all & PROT_WRITE) && writable_section)
+        atomic_fetch_or(&image_write_fast, bit);
+    else
+        atomic_fetch_and(&image_write_fast, ~bit);
+}
+
+static inline __attribute__((always_inline)) unsigned char *image_fast_span(uint64_t addr, uint32_t width, bool write) {
+    /* Lifted RIP-relative operands arrive as bare RVAs; guest pointers as VAs.
+       Like read_span, accept both, but take a bare RVA only below STACK_BASE so
+       the stack/TEB/PEB/TLS regions keep precedence. */
+    uint64_t rva = addr;
+    if (guest_image_base && addr >= guest_image_base) {
+        rva = addr - guest_image_base;
+        if (rva >= 0x20000000)
+            return NULL;
+    } else if (addr >= STACK_BASE || !addr) {
+        /* Address 0 is a null dereference: read_span raises the access violation. */
+        return NULL;
+    }
+    uint64_t page = rva >> 12;
+    if (page >= image_page_limit)
+        return NULL;
+    uint32_t i = image_page_section[page];
+    if (!i--)
+        return NULL;
+    uint64_t mask = atomic_load_explicit(write ? &image_write_fast : &image_read_fast, memory_order_relaxed);
+    if ((mask >> i & 1) && fits(rva, width, guest_sections[i].address, guest_sections[i].size))
+        return image[i] + (rva - guest_sections[i].address);
+    return NULL;
+}
 static void guest_access_violation(uint64_t, bool);
 
+/* Set once any lifted code marks a fault PC. Modules lifted without fault
+   delivery never do, so their hot heap accesses skip the thread-local checks. */
+static _Atomic bool guest_fault_pcs_used;
+
 void guest_mark_fault_pc(uint64_t address) {
+    if (!atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed))
+        atomic_store_explicit(&guest_fault_pcs_used, true, memory_order_relaxed);
     guest_fault_pc = address;
 }
 static uint64_t watched_rva = UINT64_MAX;
@@ -420,10 +488,16 @@ static unsigned char *module_span(uint64_t address, uint64_t size, bool writable
     return NULL;
 }
 
+/* Out of line so the thread-local fault state is only read on this rare path. */
+static __attribute__((noinline, cold)) void read_span_null(void) {
+    if (guest_fault_pc && current_cpu && !delivering_fault)
+        guest_access_violation(0, false);
+}
+
 static const unsigned char *read_span(uint64_t addr, uint64_t size) {
     uint64_t original = addr;
-    if (!addr && guest_fault_pc && current_cpu && !delivering_fault)
-        guest_access_violation(addr, false);
+    if (__builtin_expect(!addr, 0))
+        read_span_null();
     if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG)
         return (const unsigned char *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
     if (fits(addr, size, STACK_BASE, STACK_SIZE)) {
@@ -469,7 +543,7 @@ uint64_t guest_load_slow(uint64_t addr, uint32_t width) {
     if (!width || width > sizeof value)
         fault();
     const void *source = read_span(addr, width);
-    if (guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
+    if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
         guest_faultable_copy(&value, source, width, addr, false);
     else
         memcpy(&value, source, width);
@@ -480,7 +554,7 @@ __attribute__((always_inline)) uint64_t guest_load(uint64_t addr, uint32_t width
     if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
         uint64_t val = 0;
         const void *source = (const void *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
-        if (guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
+        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
             guest_faultable_copy(&val, source, width, addr, false);
         else
             memcpy(&val, source, width);
@@ -489,6 +563,12 @@ __attribute__((always_inline)) uint64_t guest_load(uint64_t addr, uint32_t width
     if (fits(addr, width, STACK_BASE, STACK_SIZE)) {
         uint64_t val = 0;
         memcpy(&val, stack + (addr - STACK_BASE), width);
+        return val;
+    }
+    const unsigned char *section = image_fast_span(addr, width, false);
+    if (section) {
+        uint64_t val = 0;
+        memcpy(&val, section, width);
         return val;
     }
     return guest_load_slow(addr, width);
@@ -660,6 +740,7 @@ static void forget_attached_module(struct guest_module *module) {
 }
 
 static uint64_t load_application_module(const char *name);
+static char *subsys_append_mapping_ranges(char *ranges);
 static void release_application_module(struct guest_module *module);
 
 /*
@@ -926,6 +1007,20 @@ static struct guest_module *translate_guest_module(const char *name, const char 
                           (unsigned long long)(item->module->base + item->module->size));
         free(ranges);
         ranges = next;
+    }
+    for (size_t i = 0; result >= 0 && i < guest_module_count; ++i) {
+        char *next = NULL;
+        result = asprintf(&next, "%s,%llu:%llu", ranges,
+                          (unsigned long long)guest_modules[i].base,
+                          (unsigned long long)(guest_modules[i].base + guest_modules[i].size));
+        free(ranges);
+        ranges = next;
+    }
+    /* Live VirtualAlloc regions and mapped views: a DLL must not land on them. */
+    if (result >= 0) {
+        ranges = subsys_append_mapping_ranges(ranges);
+        if (!ranges)
+            result = -1;
     }
     size_t env_count = 0;
     while (environ[env_count])
@@ -1413,7 +1508,7 @@ void guest_store_slow(uint64_t addr, uint64_t value, uint32_t width) {
             }
             fault();
         }
-        if (guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
+        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
             guest_faultable_copy(heap, &value, width, original, true);
         else
             memcpy(heap, &value, width);
@@ -1428,7 +1523,7 @@ void guest_store_slow(uint64_t addr, uint64_t value, uint32_t width) {
 __attribute__((always_inline)) void guest_store(uint64_t addr, uint64_t value, uint32_t width) {
     if ((addr & UINT64_C(0xFF00000000000000)) == GUEST_HEAP_TAG) {
         void *destination = (void *)(uintptr_t)(addr & ~UINT64_C(0xFF00000000000000));
-        if (guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
+        if (atomic_load_explicit(&guest_fault_pcs_used, memory_order_relaxed) && guest_signal_ready && guest_fault_pc && current_cpu && !delivering_fault)
             guest_faultable_copy(destination, &value, width, addr, true);
         else
             memcpy(destination, &value, width);
@@ -1436,6 +1531,11 @@ __attribute__((always_inline)) void guest_store(uint64_t addr, uint64_t value, u
     }
     if (fits(addr, width, STACK_BASE, STACK_SIZE)) {
         memcpy(stack + (addr - STACK_BASE), &value, width);
+        return;
+    }
+    unsigned char *section = image_fast_span(addr, width, true);
+    if (section) {
+        memcpy(section, &value, width);
         return;
     }
     guest_store_slow(addr, value, width);
@@ -2252,6 +2352,31 @@ void guest_startup_info(uint64_t destination) {
     for (unsigned offset = 0; offset < 104; offset += 8)
         guest_store(destination + offset, 0, 8);
     guest_store(destination, 104, 4);
+}
+
+/*
+ * Guest address ranges that host mappings handed to the guest (VirtualAlloc,
+ * MapViewOfFile) must never overlap, because the runtime resolves addresses
+ * in them as image memory: the primary image window and every guest DLL
+ * image [base, base + SizeOfImage), linked-in or translated on demand.
+ * Linked-in modules are reserved even before they load, since their bases are
+ * fixed at build time. Returns the end of the first overlapping range, or 0.
+ */
+static uint64_t guest_reserved_overlap(uint64_t address, uint64_t size) {
+    uint64_t end = address + (size ? size : 1);
+    if (end < address)
+        return UINT64_MAX;
+    if (guest_image_base && address < guest_image_base + 0x20000000 && end > guest_image_base)
+        return guest_image_base + 0x20000000;
+    for (size_t i = 0; i < guest_module_count; ++i) {
+        const struct guest_module *module = &guest_modules[i];
+        if (address < module->base + module->size && end > module->base)
+            return module->base + module->size;
+    }
+    for (struct translated_module *item = atomic_load(&translated_modules); item; item = item->next)
+        if (address < item->module->base + item->module->size && end > item->module->base)
+            return item->module->base + item->module->size;
+    return 0;
 }
 
 #include "console_subsystems.h"
@@ -4213,8 +4338,11 @@ uint64_t guest_virtual_protect(uint64_t address, uint64_t size, uint32_t new_pro
                 page_end = max_end;
             if (page_start < (uintptr_t)image[i])
                 page_start = (uintptr_t)image[i];
-            if (page_end > page_start)
-                mprotect((void *)page_start, page_end - page_start, prot);
+            if (page_end > page_start && mprotect((void *)page_start, page_end - page_start, prot) == 0) {
+                for (uintptr_t page = page_start; page < page_end; page += page_size)
+                    image_page_prot[i][(page - (uintptr_t)image[i]) / page_size] = prot;
+                image_update_fast(i, section->writable);
+            }
             if (old_protect_ptr)
                 guest_store(old_protect_ptr, old, 4);
             return 1;
@@ -5044,7 +5172,9 @@ int main(int argc, char **argv) {
     put64(peb, 0x30, 0x7fff2001); /* ProcessHeap, read directly by Wine's CRT */
     image = calloc(guest_section_count ? guest_section_count : 1, sizeof *image);
     section_protection = calloc(guest_section_count ? guest_section_count : 1, sizeof *section_protection);
-    if (!image || !section_protection)
+    image_page_prot = calloc(guest_section_count ? guest_section_count : 1, sizeof *image_page_prot);
+    image_page_count = calloc(guest_section_count ? guest_section_count : 1, sizeof *image_page_count);
+    if (!image || !section_protection || !image_page_prot || !image_page_count)
         fault();
     size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     for (uint64_t i = 0; i < guest_section_count; ++i) {
@@ -5058,6 +5188,28 @@ int main(int argc, char **argv) {
         section_protection[i] = section->writable ? 0x04 : 0x02;
         if (section->initial_size)
             memcpy(image[i], section->initial, section->initial_size);
+        image_page_count[i] = alloc_size / page_size;
+        image_page_prot[i] = malloc(image_page_count[i] * sizeof **image_page_prot);
+        if (!image_page_prot[i])
+            fault();
+        for (size_t page = 0; page < image_page_count[i]; ++page)
+            image_page_prot[i][page] = PROT_READ | PROT_WRITE;
+        image_update_fast(i, section->writable);
+    }
+    for (uint64_t i = 0; i < guest_section_count && i < 64; ++i) {
+        uint64_t end = (guest_sections[i].address + guest_sections[i].size + 0xfff) >> 12;
+        if (end > image_page_limit && end <= (0x20000000 >> 12))
+            image_page_limit = end;
+    }
+    image_page_section = calloc(image_page_limit ? image_page_limit : 1, 1);
+    if (!image_page_section)
+        fault();
+    for (uint64_t i = guest_section_count < 64 ? guest_section_count : 64; i-- > 0;) {
+        uint64_t first = guest_sections[i].address >> 12;
+        uint64_t end = (guest_sections[i].address + guest_sections[i].size + 0xfff) >> 12;
+        for (uint64_t page = first; page < end && page < image_page_limit; ++page)
+            if (!image_page_section[page] || (guest_sections[i].address & 0xfff) == 0)
+                image_page_section[page] = (uint8_t)(i + 1);
     }
     init_guest_thread_data();
     if (guest_tls_index_va) {

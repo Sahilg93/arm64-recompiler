@@ -6,10 +6,13 @@ ExitProcess
 FreeLibrary
 GetCurrentThreadId
 GetExitCodeThread
+GetLastError
 GetProcAddress
 LoadLibraryW
 TlsAlloc
 TlsFree
 TlsGetValue
 TlsSetValue
+VirtualAlloc
+VirtualFree
 WaitForSingleObject
